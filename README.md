@@ -114,13 +114,15 @@ Caller winmini (omp 18.13.3) → Studio (omp 18.12.6) and MacBook (omp 18.13.0),
 
 After every cancel and drop, `ps` on the remote host showed no process carrying the run ID, and `supervisor.log` recorded `groupGone: true` (reason `terminate` for cancel, `stdin_eof` within about one second for drop). The first Studio cancel attempt exposed a macOS behaviour: `kill(-pgid, 0)` returns `EPERM` for a group that holds only zombies; the supervisor now settles that case with `ps`.
 
+After `omp plugin link .` on winmini with `~/.omp/agent/omp-remote-subtask.json`, a fresh `omp -p` session called `remote_task` against MacBook and printed the remote answer (completed in about 12 s end to end).
+
 ## Not verified yet
 
 - Runs that reach the `--max-time`/supervisor deadline, and SIGKILL escalation against a child that ignores TERM, on real hosts (covered only by the local fake-omp tests).
 - Network loss where the remote sshd does not notice the drop (e.g. a sleeping laptop or a cut link rather than a killed client): the supervisor relies on stdin EOF, so cleanup then waits for TCP keepalive or the run deadline.
 - Remote hosts other than the two above, Linux remote hosts, and omp versions other than 18.12.6 / 18.13.0.
-- Use through `omp plugin link` / `omp plugin install` in a live interactive session; the extension load was checked only through RPC `get_state` with `--extension`.
-- Retention: run directories under the MacBook fallback (`~/.cache/agent-work/omp-remote-subtask/runs`) are not managed by `agent_work.py gc`.
+- Interactive TUI use (approval prompt, progress rendering, Esc cancellation); only `omp -p` and the smoke script were exercised.
+- Retention: run directories under the home-cache fallback (`~/.cache/agent-work/omp-remote-subtask/runs`, used on MacBook and locally when the caller cwd is not a checkout) are not managed by `agent_work.py gc`.
 
 ## License
 
