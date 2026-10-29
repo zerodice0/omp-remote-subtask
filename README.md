@@ -138,6 +138,17 @@ Role resolution, observed through RPC `get_state` with `--model @<role>` (no pro
 
 Real role runs: MacBook `tiny` completed with haiku-4-5/minimal in 4.4 s (cost $0.0133), Studio `tiny` completed with gpt-6-luna/low in 5.0 s ($0.0021), and Studio without a role used `explore` and completed with gpt-6.1-sol/medium in 6.5 s ($0.0410).
 
+Four-role delegation review (2026-10-29): fresh `omp -p` caller sessions on winmini (`openai-codex/gpt-6.1-sol`, medium) each called the linked `remote_task` once against Studio `couple-calendar`, with an answer-format requirement and an unrelated internal note in the caller prompt.
+
+| Role | Remote model | Remote duration | Remote tool calls | Input / cache read / output tokens | Cost (USD) |
+|---|---|---|---|---|---|
+| `tiny` | gpt-6-luna, low | 3.9 s | 1 | 20,310 / 11,008 / 61 | 0.0022 |
+| `smol` | gpt-6.1-terra, low | 6.8 s | 2 | 19,953 / 11,008 / 267 | 0 (as reported by omp) |
+| `explore` | gpt-6.1-sol, medium | 106.5 s | 14 | 36,089 / 144,000 / 4,075 | 0.1273 |
+| `slow` | claude-opus-5-5, xhigh | 325.2 s | 63 | 78 / 2,696,783 / 28,757 | 2.0367 |
+
+All four completed and returned the remote answer to the caller. Every caller restated the format requirement inside `task` and none forwarded the unrelated note; each remote session held exactly one user message, equal to `task`. The remote system prompt included the repository's own `AGENTS.md`. Caller conversation, files and earlier tool results are not transferred: `task` is the only caller context. The `slow` run exceeded the 300-second `defaultTimeoutSeconds` used in the example configuration and finished only because the caller set 600 seconds. The `tiny` answer gave the right version but cited `pubspec.yaml:15` instead of line 19.
+
 ## Not verified yet
 
 - Runs that reach the `--max-time`/supervisor deadline, and SIGKILL escalation against a child that ignores TERM, on real hosts (covered only by the local fake-omp tests).
