@@ -2,7 +2,7 @@ import { stripVTControlCharacters } from 'node:util';
 import { createRunState, reduceRunState, type RunUsage } from './run-state.ts';
 import type { RpcFrame } from './rpc-frames.ts';
 import type { RemoteRole } from './config.ts';
-import type { RemoteTaskDetails } from './runner.ts';
+import type { RemoteMode, RemoteTaskDetails } from './runner.ts';
 
 export type RemotePhase = 'probe' | 'starting' | 'running' | 'cancel_abort' | 'cancel_terminate' | 'stats';
 export interface RemoteToolCall {
@@ -10,7 +10,7 @@ export interface RemoteToolCall {
   startedAt: number; durationMs: number;
 }
 export interface RemoteProgress {
-  runId: string; host: string; role: RemoteRole; actualModel: string | null; thinkingLevel: string | null;
+  runId: string; host: string; role: RemoteRole; mode: RemoteMode; actualModel: string | null; thinkingLevel: string | null;
   phase: RemotePhase; startedAt: number; elapsedMs: number;
   toolCalls: RemoteToolCall[]; totalToolCalls: number; usage: RunUsage; assistantTextTail: string;
 }
@@ -44,8 +44,8 @@ export function summarizeArgs(name: string, raw: unknown): string {
   try { return fitLine(JSON.stringify(raw) ?? '', 80); } catch { return ''; }
 }
 
-export function createProgress(runId: string, host: string, role: RemoteRole, startedAt: number): RemoteProgress {
-  return { runId, host, role, actualModel: null, thinkingLevel: null, phase: 'probe', startedAt, elapsedMs: 0,
+export function createProgress(runId: string, host: string, role: RemoteRole, startedAt: number, mode: RemoteMode = 'read'): RemoteProgress {
+  return { runId, host, role, mode, actualModel: null, thinkingLevel: null, phase: 'probe', startedAt, elapsedMs: 0,
     toolCalls: [], totalToolCalls: 0, usage: createRunState().usage, assistantTextTail: '' };
 }
 
@@ -89,9 +89,10 @@ const tokens = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n
 const modelLabel = (model: string | null, effort: string | null) => `${model ?? 'resolving model'}${effort ? ` · ${effort}` : ''}`;
 const usageLabel = (usage: RunUsage | null) => usage ? `in ${tokens(usage.input)} out ${tokens(usage.output)} cache ${tokens(usage.cacheRead)} · $${usage.cost.total.toFixed(4)}` : '';
 const toolLine = (call: RemoteToolCall) => `${call.status === 'running' ? '◷' : call.status === 'error' ? '✗' : '✓'} ${call.name} ${call.args} · ${duration(call.durationMs)}`;
+const modePrefix = (mode: RemoteMode | undefined) => mode === 'exec' ? '[exec] ' : '';
 
 export function progressText(progress: RemoteProgress): string {
-  return [ `${progress.host} · ${progress.role} · ${progress.phase} · ${modelLabel(progress.actualModel, progress.thinkingLevel)} · ${duration(progress.elapsedMs)} · ${progress.totalToolCalls} tools · ${usageLabel(progress.usage)}`,
+  return [ `${modePrefix(progress.mode)}${progress.host} · ${progress.role} · ${progress.phase} · ${modelLabel(progress.actualModel, progress.thinkingLevel)} · ${duration(progress.elapsedMs)} · ${progress.totalToolCalls} tools · ${usageLabel(progress.usage)}`,
     ...progress.toolCalls.slice(-4).map(toolLine), ...clean(progress.assistantTextTail).split('\n').slice(-3),
   ].join('\n');
 }
@@ -126,8 +127,8 @@ function component(build: (width: number) => string[]): RenderComponent {
   return { render(width) { width = Math.max(0, Math.floor(width)); if (width !== lastWidth) { rows = build(width); lastWidth = width; } return rows; }, invalidate() { lastWidth = -1; } };
 }
 
-export function renderCall(args: { host?: string; role?: string; task?: string }, _options: RenderOptions, theme?: RenderTheme): RenderComponent {
-  return component(width => [color(theme, 'toolTitle', fitLine(`${args.host ?? 'remote'} · ${args.role ?? 'host default'} · ${args.task ?? ''}`, width))]);
+export function renderCall(args: { host?: string; role?: string; task?: string; mode?: RemoteMode }, _options: RenderOptions, theme?: RenderTheme): RenderComponent {
+  return component(width => [color(theme, 'toolTitle', fitLine(`${modePrefix(args.mode)}${args.host ?? 'remote'} · ${args.role ?? 'host default'} · ${args.task ?? ''}`, width))]);
 }
 
 export function renderResult(result: RemoteRenderResult, options: RenderOptions, theme?: RenderTheme): RenderComponent {
@@ -139,14 +140,14 @@ export function renderResult(result: RemoteRenderResult, options: RenderOptions,
       for (const line of clean(text).split('\n')) for (const row of wrap ? wrapLine(line, width) : [fitLine(line, width)]) rows.push(color(theme, tone, row));
     };
     if (options.isPartial && progress) {
-      add(`${progress.host} · ${progress.role} · ${progress.phase} · ${modelLabel(progress.actualModel, progress.thinkingLevel)}`, 'accent', true);
+      add(`${modePrefix(progress.mode)}${progress.host} · ${progress.role} · ${progress.phase} · ${modelLabel(progress.actualModel, progress.thinkingLevel)}`, 'accent', true);
       add(`${duration(progress.elapsedMs)} · ${progress.totalToolCalls} tools · ${usageLabel(progress.usage)}`, 'muted', true);
       for (const call of progress.toolCalls.slice(-6)) add(toolLine(call), call.status === 'error' ? 'error' : call.status === 'running' ? 'accent' : 'dim');
       for (const line of clean(progress.assistantTextTail).split('\n').filter(Boolean).slice(-3)) add(line);
       return rows;
     }
     const status = details?.status ?? (result.isError ? 'failed' : 'completed');
-    add(`${status} · ${details?.host ?? 'remote'} · ${details?.role ?? ''} · ${modelLabel(details?.actualModel ?? null, details?.thinkingLevel ?? null)}`, status === 'completed' ? 'success' : 'error', true);
+    add(`${modePrefix(details?.mode)}${status} · ${details?.host ?? 'remote'} · ${details?.role ?? ''} · ${modelLabel(details?.actualModel ?? null, details?.thinkingLevel ?? null)}`, status === 'completed' ? 'success' : 'error', true);
     add(`${duration(details?.durationMs ?? 0)} · ${details?.totalToolCalls ?? details?.toolCalls?.length ?? 0} tools · ${usageLabel(details?.usage ?? null)}`, 'muted', true);
     const answer = result.content.filter(part => part.type === 'text').map(part => part.text ?? '').join('\n');
     const answerLines = clean(answer).split('\n');

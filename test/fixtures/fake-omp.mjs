@@ -1,5 +1,5 @@
 import { spawn } from 'node:child_process';
-import { appendFileSync } from 'node:fs';
+import { appendFileSync, readFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 
 if (process.argv[2] === '--transport') {
@@ -21,6 +21,14 @@ if (process.argv[2] === '--transport') {
   }
   // The executable wrapper checks the supervisor removed BUN_BE_BUN before selecting Bun.
   delete process.env.BUN_BE_BUN;
+  const toolsIndex = process.argv.indexOf('--tools');
+  const tools = toolsIndex < 0 ? ['read', 'grep', 'glob'] : process.argv[toolsIndex + 1].split(',');
+  const configIndex = process.argv.indexOf('--config');
+  const overlay = configIndex < 0 ? '' : readFileSync(process.argv[configIndex + 1], 'utf8');
+  // Legacy xdev exposes write implicitly even when --tools omits it.
+  if (!/^\s+xdev:\s*false\s*$/m.test(overlay) && !tools.includes('write')) tools.push('write');
+  if (mode === 'bad-tools') tools.push('bash');
+  if (mode.startsWith('bad-tools:')) tools.push(mode.slice('bad-tools:'.length));
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
   let sleeping;
   let active = false;
@@ -42,7 +50,7 @@ if (process.argv[2] === '--transport') {
     const command = JSON.parse(line);
     const response = data => send({ type: 'response', id: command.id, command: command.type, success: true, data });
     if (command.type === 'negotiate_protocol') response({ protocolVersion: 2 });
-    else if (command.type === 'get_state') response({ dumpTools: (mode === 'bad-tools' ? ['read', 'bash'] : ['read', 'grep', 'glob', 'write']).map(name => ({ name })), systemPrompt: ['Inherited context'], contextUsage: { tokens: 12 }, model: { provider: 'fake', id: 'model' }, thinkingLevel: 'medium', sessionFile: process.cwd() + '/fake-session.jsonl' });
+    else if (command.type === 'get_state') response({ dumpTools: tools.map(name => ({ name })), systemPrompt: ['Inherited context'], contextUsage: { tokens: 12 }, model: { provider: 'fake', id: 'model' }, thinkingLevel: 'medium', sessionFile: process.cwd() + '/fake-session.jsonl' });
     else if (command.type === 'prompt') {
       active = true;
       response({});

@@ -8,16 +8,17 @@ import { loadConfig, resolveHost, REMOTE_ROLES, type HostsConfig, type RemoteRol
 import { controlPath, remoteShellCommand, sshArgv } from './ssh.ts';
 import { buildProbeScript, parseProbe, supportedFlags, buildLaunchScript, buildCleanupCheckScript } from './remote-scripts.ts';
 import { LineSplitter, RpcFrameDecoder, negotiate } from './rpc-frames.ts';
-import { createRunState, reduceRunState, decide, type RunEvent, type RunState, type RunStatus } from './run-state.ts';
+import { checkInheritedTools, createRunState, reduceRunState, decide, type RunEvent, type RunState, type RunStatus } from './run-state.ts';
 import { createProgress, reduceProgress, progressSnapshot, progressText, type RemotePhase, type RemoteProgress, type RemoteToolCall } from './render.ts';
 
-export interface RemoteTaskParams { host: string; cwd: string; task: string; role?: RemoteRole; timeoutSeconds?: number }
+export type RemoteMode = 'read' | 'exec';
+export interface RemoteTaskParams { host: string; cwd: string; task: string; mode?: RemoteMode; role?: RemoteRole; timeoutSeconds?: number }
 export interface TransportRequest {
   kind: 'probe' | 'launch' | 'cleanup'; argv: string[]; script: string;
   supervisorConfig?: SupervisorConfig;
 }
 export interface SupervisorConfig {
-  runId: string; ompPath: string; ompArgs: string[]; cwd: string; runDir: string;
+  runId: string; ompPath: string; ompArgs: string[]; cwd: string; runDir: string; mode?: RemoteMode;
   deadlineSeconds: number; graceSeconds: number; overlayYaml: string;
 }
 export interface RunnerOptions {
@@ -27,7 +28,7 @@ export interface RunnerOptions {
   graceSeconds?: number;
 }
 export interface RemoteTaskDetails {
-  runId: string; host: string; cwd: string; status: RunStatus;
+  runId: string; host: string; cwd: string; mode: RemoteMode; status: RunStatus;
   revision: { commit: string; branch: string; dirtyCount: number | null } | null;
   role: RemoteRole; actualModel: string | null; thinkingLevel: string | null; usage: RunState['usage'] | null;
   remoteSessionPath: string | null; remoteRunDir: string | null; localLogDir: string;
@@ -40,9 +41,23 @@ export interface RemoteTaskDetails {
 }
 export const READ_ONLY_NOTE = 'You are running as a remote read-only subtask launched by another omp session through remote_task. Do not modify files. Investigate with read/grep/glob and finish with a final answer that fully states the result.';
 export const OVERLAY_YAML = 'autolearn:\n  enabled: false\nmemory:\n  backend: off\nasync:\n  enabled: false\ntools:\n  approval:\n    write: deny\n    edit: deny\n    bash: deny\n    eval: deny\n    ast_edit: deny\n    task: deny\n    browser: deny\n';
+export const EXEC_TOOLS = ['read', 'grep', 'glob', 'bash', 'edit'] as const;
+export const EXEC_OVERLAY_YAML = 'autolearn:\n  enabled: false\nmemory:\n  backend: off\nasync:\n  enabled: false\ntools:\n  xdev: false\n  approvalMode: yolo\n  approval:\n    read: allow\n    grep: allow\n    glob: allow\n    bash: allow\n    edit: allow\n    write: deny\n    task: deny\n    eval: deny\n    browser: deny\n    ast_edit: deny\n    computer: deny\n    generate_image: deny\n    web_search: deny\n';
+export const MCP_DISCOVERY_PROVIDERS = ['native', 'omp-plugins', 'claude', 'agent-plugins', 'claude-plugins', 'codex', 'gemini', 'opencode', 'cursor', 'windsurf', 'vscode', 'mcp-json'] as const;
+export function execOverlay(disabledProviders: unknown[] = []): string {
+  return EXEC_OVERLAY_YAML + `disabledProviders: ${JSON.stringify([...new Set([...disabledProviders, ...MCP_DISCOVERY_PROVIDERS])])}\n`;
+}
+export function execNote(runDir: string, runId: string, heavySlot: boolean): string {
+  return [
+    'You are running an opt-in remote exec subtask launched by another omp session through remote_task.',
+    `Work only inside the cwd and ${runDir}/work. TMPDIR is ${runDir}/tmp; never use /tmp. Create scratch directories with mktemp -d -p ${JSON.stringify(`${runDir}/work`)}.`,
+    ...(heavySlot ? [`Run heavy commands (simulation batches, builds, Playwright/browsers, bulk image processing) through ~/.config/herdr/scripts/heavy_slot.py run --label "remote_task ${runId}" -- <cmd>. It may wait for a free slot.`] : []),
+    'Do not git commit/push/checkout/branch/reset/stash. Do not install packages or change global configuration. Do not start servers or background daemons that outlive the command. Do not kill processes you did not start.',
+    `Write outputs under ${runDir}/work, or the cwd only when the task asks. Report absolute paths of produced files in your final answer. Results remain files on the remote host and are not copied back automatically.`,
+  ].join('\n');
+}
 const CONTEXT_NOTE = 'Context files are inherited from the remote cwd ancestry and home; this profile does not disable them.';
 const SUPERVISOR_SOURCE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'supervisor.mjs'), 'utf8');
-const ALLOWED_TOOLS: Record<string, true> = { read: true, grep: true, glob: true, write: true };
 const defaultTransport = ({ argv }: TransportRequest) => spawn(argv[0], argv.slice(1), { stdio: 'pipe' });
 
 async function capture(child: ChildProcess, timeoutMs: number, signal?: AbortSignal): Promise<string> {
@@ -99,7 +114,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   const startedAt = Date.now();
   const runId = `rst-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${randomBytes(3).toString('hex')}`;
   const localLogDir = await localLogDirectory(options.cwd ?? process.cwd(), runId);
-  const details: RemoteTaskDetails = { runId, host: params.host, cwd: params.cwd, revision: null, status: 'failed', role: 'explore', actualModel: null, thinkingLevel: null, usage: null, remoteSessionPath: null, remoteRunDir: null, localLogDir, cancellationConfirmed: false, inheritance: null, remoteOmpVersion: null, protocolVersion: null, durationMs: 0, toolCalls: [], totalToolCalls: 0 };
+  const details: RemoteTaskDetails = { runId, host: params.host, cwd: params.cwd, mode: params.mode ?? 'read', revision: null, status: 'failed', role: 'explore', actualModel: null, thinkingLevel: null, usage: null, remoteSessionPath: null, remoteRunDir: null, localLogDir, cancellationConfirmed: false, inheritance: null, remoteOmpVersion: null, protocolVersion: null, durationMs: 0, toolCalls: [], totalToolCalls: 0 };
   const record = (direction: string, value: unknown) => appendFileSync(join(localLogDir, 'events.jsonl'), JSON.stringify({ ts: new Date().toISOString(), direction, value }) + '\n', { mode: 0o600 });
   const transport = options.transport ?? defaultTransport;
   const graceMs = Math.max(10, (options.graceSeconds ?? 10) * 1000);
@@ -113,7 +128,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   let completionDecided = false;
   let phase: RemotePhase = 'probe';
   let lastUpdate = 0;
-  let progress = createProgress(runId, params.host, details.role, startedAt);
+  let progress = createProgress(runId, params.host, details.role, startedAt, details.mode);
   let progressTimer: NodeJS.Timeout | undefined;
   const update = () => {
     const now = Date.now();
@@ -156,6 +171,8 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   try {
     const config = options.config ?? loadConfig();
     const host = resolveHost(config, params.host);
+    if (params.mode !== undefined && params.mode !== 'read' && params.mode !== 'exec') throw new Error('invalid_mode: expected read or exec');
+    if (details.mode === 'exec' && host.allowExec !== true) throw new Error(`exec_not_allowed: host ${JSON.stringify(params.host)} requires allowExec: true`);
     if (!isAbsolute(params.cwd) || /[\0\r\n]/.test(params.cwd)) throw new Error('invalid_cwd: expected an absolute path without NUL/newlines');
     if (typeof params.task !== 'string' || !params.task.trim()) throw new Error('invalid_task');
     if (params.role !== undefined && !REMOTE_ROLES.includes(params.role)) throw new Error('invalid_role');
@@ -168,17 +185,18 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     cleanupCheck = () => request('cleanup', buildCleanupCheckScript({ runId }));
     update();
     progressTimer = setInterval(update, 500);
-    const probe = parseProbe(await capture(request('probe', buildProbeScript({ cwd: params.cwd, runId })), 30000, options.signal));
+    const probe = parseProbe(await capture(request('probe', buildProbeScript({ cwd: params.cwd, runId, exec: details.mode === 'exec' })), 30000, options.signal));
     if (!probe.cwdReal) throw new Error('remote_cwd_missing');
     if (host.allowedCwdRoots?.length && !host.allowedCwdRoots.some(root => inside(probe.cwdReal!, root))) throw new Error('remote_cwd_not_allowed');
     if (!probe.ompPath || !probe.runDir || !probe.bunVersion) throw new Error('unsupported_remote_omp: missing omp, embedded Bun, or run directory');
     details.cwd = probe.cwdReal; details.remoteRunDir = probe.runDir; details.remoteOmpVersion = probe.ompVersion;
     details.revision = probe.revision ? { commit: probe.revision, branch: probe.branch, dirtyCount: probe.dirtyCount } : null;
-    const ompArgs = ['--mode', 'rpc', '--no-ui', '--cwd', probe.cwdReal, '--session-dir', join(probe.runDir, 'sessions'), '--no-title', '--tools', 'read,grep,glob', '--no-extensions', '--no-skills', '--no-rules', '--no-prewalk', '--no-lsp', '--no-pty', '--config', join(probe.runDir, 'overlay.yml'), '--append-system-prompt', READ_ONLY_NOTE, '--model', `@${details.role}`, '--max-time', String(timeoutSeconds)];
+    const exec = details.mode === 'exec';
+    const ompArgs = ['--mode', 'rpc', '--no-ui', '--cwd', probe.cwdReal, '--session-dir', join(probe.runDir, 'sessions'), '--no-title', '--tools', exec ? EXEC_TOOLS.join(',') : 'read,grep,glob', '--no-extensions', '--no-skills', '--no-rules', '--no-prewalk', '--no-lsp', '--no-pty', '--config', join(probe.runDir, 'overlay.yml'), '--append-system-prompt', exec ? execNote(probe.runDir, runId, probe.heavySlot) : READ_ONLY_NOTE, '--model', `@${details.role}`, '--max-time', String(timeoutSeconds)];
     const flags = supportedFlags(probe.help);
     for (const arg of ompArgs) if (arg.startsWith('--') && !flags.has(arg)) throw new Error(`unsupported_remote_omp: missing ${arg}`);
     if (options.signal?.aborted) throw new Error('aborted_before_launch');
-    const supervisorConfig: SupervisorConfig = { runId, ompPath: probe.ompPath, ompArgs, cwd: probe.cwdReal, runDir: probe.runDir, deadlineSeconds: timeoutSeconds, graceSeconds: graceMs / 1000, overlayYaml: OVERLAY_YAML };
+    const supervisorConfig: SupervisorConfig = { runId, ompPath: probe.ompPath, ompArgs, cwd: probe.cwdReal, runDir: probe.runDir, mode: details.mode, deadlineSeconds: timeoutSeconds, graceSeconds: graceMs / 1000, overlayYaml: exec ? execOverlay(probe.disabledProviders) : OVERLAY_YAML };
     const splitter = new LineSplitter(); const decoder = new RpcFrameDecoder();
     phase = 'starting'; update();
     child = request('launch', buildLaunchScript({ ompPath: probe.ompPath, runDir: probe.runDir, supervisorSource: SUPERVISOR_SOURCE, supervisorConfig }), supervisorConfig);
@@ -228,10 +246,11 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
         if (!frame.success) throw new Error('remote_get_state_failed');
         const remoteState = parseRemoteState(frame.data);
         details.inheritance = remoteState.inheritance;
+        if (details.mode === 'exec') details.inheritance.contextFilesNote = 'Exec disables MCP discovery providers and their context-file/skill/rule discovery; global/project model settings and authentication are inherited.';
         details.remoteSessionPath = remoteState.remoteSessionPath;
         details.thinkingLevel = remoteState.thinkingLevel;
         const tools = remoteState.inheritance.tools;
-        if (tools.some(name => !Object.hasOwn(ALLOWED_TOOLS, name))) throw new Error('unexpected_remote_tools');
+        if (!checkInheritedTools(tools, details.mode === 'exec' ? EXEC_TOOLS : undefined).ok) throw new Error('unexpected_remote_tools');
         if (!sentPrompt && !cancelling) { sentPrompt = true; send({ id: 'prompt-1', type: 'prompt', message: params.task }); promptSent = true; reduce({ kind: 'prompt_sent' }); phase = 'running'; phaseDeadline = startedAt + timeoutSeconds * 1000 + 32000; }
       }
       update();
@@ -297,7 +316,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   let text = state.lastAssistantText || (details.status === 'completed' ? 'Remote task completed without assistant text.' : `Remote task ${details.status}: ${details.error?.message ?? outcome.reason}.`);
   if (text.length > 60000) text = text.slice(0, 60000) + `\n[Truncated at 60,000 characters; full transcript: ${localLogDir}/events.jsonl]`;
   if (details.status !== 'completed' && state.lastAssistantText) text += `\nRemote task ${details.status}: ${details.error?.message ?? outcome.reason}.`;
-  text += `\n[remote_task ${details.status} host=${params.host} run=${runId}]`;
+  text += `\n[remote_task ${details.status} host=${params.host}${details.mode === 'exec' ? ' mode=exec' : ''} run=${runId}]`;
   const result = { text, details };
   writeFileSync(join(localLogDir, 'result.json'), JSON.stringify(result, null, 2) + '\n', { mode: 0o600 });
   return result;

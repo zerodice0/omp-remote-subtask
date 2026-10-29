@@ -22,10 +22,26 @@ test("strict user config, defaults and host resolution", () => {
   const cfg = config({ hosts: { studio: { sshAlias: "mac-studio", defaultRole: "explore", allowedCwdRoots: ["/Users/test/workspace/./"] } } });
   expect(cfg.roleTimeoutSeconds).toEqual({ tiny: 120, smol: 300, explore: 900, slow: 1800 });
   expect(cfg.maxTimeoutSeconds).toBe(3600);
-  expect(resolveHost(cfg, "studio")).toEqual({ sshAlias: "mac-studio", defaultRole: "explore", allowedCwdRoots: ["/Users/test/workspace/"] });
+  expect(resolveHost(cfg, "studio")).toEqual({ sshAlias: "mac-studio", defaultRole: "explore", allowedCwdRoots: ["/Users/test/workspace/"], allowExec: false });
   expect(() => resolveHost(cfg, "other")).toThrow("unknown_host");
   expect(() => resolveHost(cfg, "other")).toThrow("studio");
   expect(() => resolveHost(cfg, "toString")).toThrow("unknown_host");
+});
+
+test("exec permission defaults off and accepts only explicit booleans", () => {
+  const cfg = config({ hosts: {
+    omitted: { sshAlias: "safe" },
+    disabled: { sshAlias: "safe", allowExec: false },
+    enabled: { sshAlias: "safe", allowExec: true },
+  } });
+  expect(resolveHost(cfg, "omitted").allowExec).toBe(false);
+  expect(resolveHost(cfg, "disabled").allowExec).toBe(false);
+  expect(resolveHost(cfg, "enabled").allowExec).toBe(true);
+  for (const allowExec of [null, 0, 1, "", "false", "true", [], {}]) {
+    expect(() => config({ hosts: { studio: { sshAlias: "safe", allowExec } } })).toThrow("invalid_config: hosts.studio.allowExec must be a boolean");
+  }
+  expect(() => config({ hosts: { studio: { sshAlias: "safe", allowExec: true, extra: true } } })).toThrow('unknown key "extra"');
+  expect(() => config({ hosts: {}, allowExec: true })).toThrow('config: unknown key "allowExec"');
 });
 
 test("rejects unknown keys, wrong types, invalid aliases and roots", () => {

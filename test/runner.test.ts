@@ -4,7 +4,7 @@ import type { ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { runRemoteTask, type RunnerOptions, type TransportRequest } from '../src/runner.ts';
+import { EXEC_OVERLAY_YAML, EXEC_TOOLS, OVERLAY_YAML, READ_ONLY_NOTE, execNote, execOverlay, runRemoteTask, type RemoteMode, type RunnerOptions, type SupervisorConfig, type TransportRequest } from '../src/runner.ts';
 import { posixQuote } from '../src/ssh.ts';
 import type { RemoteRole } from '../src/config.ts';
 
@@ -18,7 +18,8 @@ chmodSync(executable, 0o700);
 const config = { roleTimeoutSeconds: { tiny: 10, smol: 15, explore: 20, slow: 30 }, maxTimeoutSeconds: 60, hosts: { local: { sshAlias: 'local' } } };
 const children: number[] = [];
 const flags = '--mode --no-ui --cwd --session-dir --no-title --tools --no-extensions --no-skills --no-rules --no-prewalk --no-lsp --no-pty --config --append-system-prompt --model --max-time';
-function localTransport(mode: string) {
+const mcpDiscoveryProviders = ['native', 'omp-plugins', 'claude', 'agent-plugins', 'claude-plugins', 'codex', 'gemini', 'opencode', 'cursor', 'windsurf', 'vscode', 'mcp-json'];
+function localTransport(mode: string, heavySlot?: boolean) {
   return (request: TransportRequest) => {
     if (request.kind === 'launch') {
       const launch = request.supervisorConfig!;
@@ -31,12 +32,15 @@ function localTransport(mode: string) {
     if (request.kind === 'probe') {
       const runId = request.script.match(/rst-\d{14}-[a-f0-9]{6}/)?.[0];
       if (!runId) throw new Error('run ID missing from probe');
-      output = `omp_path=${executable}\nomp_version=fake-1\nbun_version=1.4\nhelp_b64=${Buffer.from(flags).toString('base64')}\ncwd_real=${scratch}\nrevision=\nbranch=\ndirty_count=\nrun_dir=${join(scratch, runId)}\nrun_dir_source=fallback\nhome=${scratch}\n`;
+      output = `omp_path=${executable}\nomp_version=fake-1\nbun_version=1.4\nhelp_b64=${Buffer.from(flags).toString('base64')}\ncwd_real=${scratch}\nrevision=\nbranch=\ndirty_count=\nrun_dir=${join(scratch, runId)}\nrun_dir_source=fallback\nhome=${scratch}\ndisabled_providers_json=["anthropic"]\n${heavySlot === undefined ? '' : `heavy_slot=${heavySlot ? '1' : '0'}\n`}`;
     }
     return spawn('/bin/sh', ['-c', `printf %s ${posixQuote(output)}`], { stdio: 'pipe' });
   };
 }
 function options(mode = 'complete'): RunnerOptions { return { config, cwd: process.cwd(), transport: localTransport(mode), graceSeconds: 0.15 }; }
+function execOptions(mode = 'complete', heavySlot?: boolean): RunnerOptions {
+  return { ...options(mode), config: { ...config, hosts: { local: { sshAlias: 'local', allowExec: true } } }, transport: localTransport(mode, heavySlot) };
+}
 function events(localLogDir: string) { return readFileSync(join(localLogDir, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line)); }
 function assertGone(pid: number) { expect(() => process.kill(pid, 0)).toThrow(); }
 function onFixtureReady(child: ChildProcess, action: () => void) {
@@ -55,6 +59,7 @@ test('completed: negotiates, checks inheritance, prompts once and waits for sett
   expect(result.details.protocolVersion).toBe(2);
   expect(result.details.actualModel).toBe('fake/model');
   expect(result.details.role).toBe('tiny');
+  expect(result.details.mode).toBe('read');
   expect(result.details.thinkingLevel).toBe('medium');
   expect(result.details.inheritance.model).toBe('fake/model');
   expect(result.details.inheritance.tools).toEqual(['read', 'grep', 'glob', 'write']);
@@ -123,6 +128,105 @@ test('rejects invalid runtime roles without starting transport', async () => {
   }
 });
 
+test.each([undefined, false])('exec requires explicit host opt-in (%s) before any transport', async allowExec => {
+  const opts = options();
+  opts.config = { ...config, hosts: { local: { sshAlias: 'local', allowExec } } };
+  const requests: TransportRequest[] = [];
+  opts.transport = request => { requests.push(request); throw new Error('unexpected_transport'); };
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Do not send.', mode: 'exec' }, opts);
+  expect(result.details.mode).toBe('exec');
+  expect(result.details.status).toBe('failed');
+  expect(result.details.notStarted).toBe(true);
+  expect(result.details.error.code).toBe('exec_not_allowed');
+  expect(result.details.error.message).toContain('allowExec: true');
+  expect(requests).toEqual([]);
+});
+
+test('rejects invalid runtime modes without starting transport', async () => {
+  const opts = execOptions();
+  const requests: TransportRequest[] = [];
+  opts.transport = request => { requests.push(request); throw new Error('unexpected_transport'); };
+  for (const mode of ['invalid', 'READ', 'EXEC', '', null, 1, false, {}]) {
+    const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Do not send.', mode: mode as RemoteMode }, opts);
+    expect(result.details.status).toBe('failed');
+    expect(result.details.notStarted).toBe(true);
+    expect(result.details.error.code).toBe('invalid_mode');
+  }
+  expect(requests).toEqual([]);
+});
+
+test('read overlay and note retain the legacy read-only restrictions', () => {
+  expect(OVERLAY_YAML).toBe('autolearn:\n  enabled: false\nmemory:\n  backend: off\nasync:\n  enabled: false\ntools:\n  approval:\n    write: deny\n    edit: deny\n    bash: deny\n    eval: deny\n    ast_edit: deny\n    task: deny\n    browser: deny\n');
+  expect(READ_ONLY_NOTE).toBe('You are running as a remote read-only subtask launched by another omp session through remote_task. Do not modify files. Investigate with read/grep/glob and finish with a final answer that fully states the result.');
+});
+
+test('exec overlay exposes only the five approved tools and disables xdev', () => {
+  expect(EXEC_TOOLS).toEqual(['read', 'grep', 'glob', 'bash', 'edit']);
+  expect(EXEC_OVERLAY_YAML).toBe('autolearn:\n  enabled: false\nmemory:\n  backend: off\nasync:\n  enabled: false\ntools:\n  xdev: false\n  approvalMode: yolo\n  approval:\n    read: allow\n    grep: allow\n    glob: allow\n    bash: allow\n    edit: allow\n    write: deny\n    task: deny\n    eval: deny\n    browser: deny\n    ast_edit: deny\n    computer: deny\n    generate_image: deny\n    web_search: deny\n');
+});
+
+test('exec overlay disables every MCP discovery provider without losing host-disabled providers', () => {
+  const defaults = execOverlay();
+  expect(defaults.startsWith(EXEC_OVERLAY_YAML)).toBe(true);
+  expect(JSON.parse(defaults.match(/^disabledProviders: (.+)$/m)![1])).toEqual(mcpDiscoveryProviders);
+  const inherited = ['anthropic', { provider: 'future-shape' }, 'native'];
+  const overlay = execOverlay(inherited);
+  const disabledProviders = JSON.parse(overlay.match(/^disabledProviders: (.+)$/m)![1]);
+  expect(disabledProviders).toEqual(expect.arrayContaining(['anthropic', { provider: 'future-shape' }, ...mcpDiscoveryProviders]));
+  expect(disabledProviders).toHaveLength(mcpDiscoveryProviders.length + 2);
+  expect(inherited).toEqual(['anthropic', { provider: 'future-shape' }, 'native']);
+});
+
+test.each([
+  { mode: undefined, heavySlot: undefined },
+  { mode: 'read', heavySlot: true },
+  { mode: 'exec', heavySlot: undefined },
+  { mode: 'exec', heavySlot: false },
+  { mode: 'exec', heavySlot: true },
+] as { mode?: RemoteMode; heavySlot?: boolean }[])('mode $mode selects tools, overlay and note with heavySlot=$heavySlot', async ({ mode, heavySlot }) => {
+  const opts = execOptions('complete', heavySlot);
+  const transport = opts.transport!;
+  let launch: SupervisorConfig | undefined;
+  opts.transport = request => {
+    if (request.kind === 'launch') launch = request.supervisorConfig;
+    return transport(request);
+  };
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Answer locally.', mode }, opts);
+  const exec = mode === 'exec';
+  expect(result.details.status).toBe('completed');
+  expect(result.details.mode).toBe(mode ?? 'read');
+  expect(result.details.inheritance.tools).toEqual(exec ? ['read', 'grep', 'glob', 'bash', 'edit'] : ['read', 'grep', 'glob', 'write']);
+  expect(launch).toBeDefined();
+  expect(launch!.mode).toBe(mode ?? 'read');
+  expect(launch!.ompArgs[launch!.ompArgs.indexOf('--tools') + 1]).toBe(exec ? 'read,grep,glob,bash,edit' : 'read,grep,glob');
+  expect(launch!.overlayYaml).toBe(exec ? execOverlay(['anthropic']) : OVERLAY_YAML);
+  if (exec) expect(JSON.parse(launch!.overlayYaml.match(/^disabledProviders: (.+)$/m)![1])).toEqual(['anthropic', ...mcpDiscoveryProviders]);
+  const note = launch!.ompArgs[launch!.ompArgs.indexOf('--append-system-prompt') + 1];
+  expect(note).toBe(exec ? execNote(launch!.runDir, result.details.runId, heavySlot ?? false) : READ_ONLY_NOTE);
+  expect(note.includes('heavy_slot.py')).toBe(exec && heavySlot === true);
+  const sent = events(result.details.localLogDir).filter(event => event.direction === 'sent').map(event => event.value);
+  expect(sent.filter(frame => frame.type === 'prompt')).toHaveLength(1);
+});
+
+test.each([false, true])('exec note constrains work, scratch and process behavior (heavySlot=%s)', heavySlot => {
+  const runDir = join(scratch, 'run with spaces');
+  const note = execNote(runDir, 'rst-note-unit', heavySlot);
+  expect(note).toContain(`Work only inside the cwd and ${runDir}/work.`);
+  expect(note).toContain(`TMPDIR is ${runDir}/tmp; never use /tmp.`);
+  expect(note).toContain(`mktemp -d -p ${JSON.stringify(`${runDir}/work`)}`);
+  expect(note).toContain('Do not git commit/push/checkout/branch/reset/stash.');
+  expect(note).toContain('Do not install packages or change global configuration.');
+  expect(note).toContain('Do not start servers or background daemons that outlive the command.');
+  expect(note).toContain('Do not kill processes you did not start.');
+  expect(note).toContain(`Write outputs under ${runDir}/work, or the cwd only when the task asks.`);
+  expect(note).toContain('Report absolute paths of produced files');
+  expect(note).toContain('not copied back automatically');
+  if (heavySlot) {
+    expect(note).toContain('~/.config/herdr/scripts/heavy_slot.py run --label "remote_task rst-note-unit" -- <cmd>');
+    expect(note).toContain('It may wait for a free slot.');
+  } else expect(note).not.toContain('heavy_slot');
+});
+
 test('remote startup stderr fails before sending a prompt', async () => {
   const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Do not send.', role: 'slow' }, options('startup-error'));
   expect(result.details.status).toBe('failed');
@@ -170,4 +274,16 @@ test('unexpected remote tools fail before any prompt', async () => {
   expect(result.details.status).toBe('failed');
   expect(result.details.error.code).toBe('unexpected_remote_tools');
   expect(events(result.details.localLogDir).filter(event => event.direction === 'sent' && event.value.type === 'prompt')).toHaveLength(0);
+});
+
+test.each(['write', 'task', 'eval', 'browser', 'ast_edit', 'computer', 'generate_image', 'web_search', 'mcp__server__tool', 'unknown_tool'])('exec rejects unexpected get_state tool %s before any prompt', async tool => {
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Do not send.', mode: 'exec' }, execOptions(`bad-tools:${tool}`));
+  expect(result.details.status).toBe('failed');
+  expect(result.details.mode).toBe('exec');
+  expect(result.details.notStarted).toBe(true);
+  expect(result.details.error.code).toBe('unexpected_remote_tools');
+  expect(result.details.inheritance.tools).toContain(tool);
+  const sent = events(result.details.localLogDir).filter(event => event.direction === 'sent').map(event => event.value);
+  expect(sent.some(frame => frame.type === 'get_state')).toBe(true);
+  expect(sent.filter(frame => frame.type === 'prompt')).toHaveLength(0);
 });

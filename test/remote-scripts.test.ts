@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { buildCleanupCheckScript, buildLaunchScript, buildProbeScript, parseProbe, supportedFlags } from "../src/remote-scripts.ts";
@@ -41,6 +41,8 @@ test("portable probe parses versions, flags, non-repo and fallback without creat
   expect(probe.branch).toBe("");
   expect(probe.dirtyCount).toBeNull();
   expect(probe.runDirSource).toBe("fallback");
+  expect(probe.heavySlot).toBe(false);
+  expect(output.stdout).toContain("heavy_slot=0\n");
   expect(probe.runDir).toBe(join(fakeHome, ".cache/agent-work/omp-remote-subtask/runs/probe-unit"));
   expect(existsSync(probe.runDir)).toBe(false);
   expect([...supportedFlags(probe.help)]).toEqual(["--mode", "--no-ui", "--cwd", "--max-time"]);
@@ -71,6 +73,53 @@ test("probe uses executable agent_work from resolved cwd", () => {
     expect(probe.runDir).toBe(join(scratch, "remote-subtask-agent-work-unit"));
     expect(existsSync(probe.runDir)).toBe(false);
   } finally { rmSync(program); }
+});
+
+test("probe reports heavy-slot availability only for an executable helper", () => {
+  const program = join(fakeHome, ".config/herdr/scripts/heavy_slot.py");
+  mkdirSync(join(fakeHome, ".config/herdr/scripts"), { recursive: true });
+  const probe = () => {
+    const result = run(buildProbeScript({ cwd: scratch, runId: "heavy-slot-unit" }));
+    expect(result.status).toBe(0);
+    return parseProbe(result.stdout);
+  };
+  expect(probe().heavySlot).toBe(false);
+  writeFileSync(program, "#!/bin/sh\nexit 99\n", { mode: 0o600 });
+  try {
+    expect(probe().heavySlot).toBe(false);
+    chmodSync(program, 0o700);
+    expect(probe().heavySlot).toBe(true);
+  } finally { rmSync(program); }
+  expect(probe().heavySlot).toBe(false);
+});
+
+test("heavy-slot metadata accepts legacy omission and rejects malformed fields", () => {
+  const result = run(buildProbeScript({ cwd: scratch, runId: "heavy-slot-parse" }));
+  expect(result.status).toBe(0);
+  const valid = result.stdout;
+  expect(valid).toContain("heavy_slot=0\n");
+  expect(parseProbe(valid).heavySlot).toBe(false);
+  expect(parseProbe(valid.replace("heavy_slot=0\n", "heavy_slot=1\n")).heavySlot).toBe(true);
+  expect(parseProbe(valid.replace("heavy_slot=0\n", "")).heavySlot).toBe(false);
+  for (const value of ["", "2", "-1", "true", "false", "01", " 1", "1 "]) {
+    expect(() => parseProbe(valid.replace("heavy_slot=0\n", `heavy_slot=${value}\n`))).toThrow("invalid_probe");
+  }
+  expect(() => parseProbe(valid + "heavy_slot=1\n")).toThrow("invalid_probe");
+});
+
+test("disabled-provider metadata preserves arrays and defaults legacy omission to empty", () => {
+  const result = run(buildProbeScript({ cwd: scratch, runId: "disabled-provider-parse" }));
+  expect(result.status).toBe(0);
+  expect(parseProbe(result.stdout).disabledProviders).toEqual([]);
+  const providers = ["anthropic", "existing-provider", { provider: "future-shape" }, null, 7];
+  expect(parseProbe(result.stdout + `disabled_providers_json=${JSON.stringify(providers)}\n`).disabledProviders).toEqual(providers);
+  expect(parseProbe(result.stdout + "disabled_providers_json=[]\n").disabledProviders).toEqual([]);
+});
+
+test.each(["", "[", "undefined", "null", "true", "3", '"anthropic"', '{"provider":"anthropic"}'])("rejects malformed disabled-provider metadata %s", value => {
+  const result = run(buildProbeScript({ cwd: scratch, runId: "disabled-provider-invalid" }));
+  expect(result.status).toBe(0);
+  expect(() => parseProbe(result.stdout + `disabled_providers_json=${value}\n`)).toThrow("invalid_probe");
 });
 
 test("parses base64 fields strictly and rejects malformed probe metadata", () => {

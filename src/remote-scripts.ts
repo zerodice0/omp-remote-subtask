@@ -13,13 +13,15 @@ export interface ProbeResult {
   runDir: string;
   runDirSource: "agent_work" | "fallback";
   home: string;
+  heavySlot: boolean;
+  disabledProviders: unknown[];
 }
 
 function checkRunId(runId: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?![\s\S])/.test(runId) || runId === "." || runId === "..") throw new Error("invalid_run_id");
 }
 
-export function buildProbeScript({ cwd, runId }: { cwd: string; runId: string }): string {
+export function buildProbeScript({ cwd, runId, exec = false }: { cwd: string; runId: string; exec?: boolean }): string {
   checkRunId(runId);
   return `set -eu
 emit() {
@@ -38,10 +40,14 @@ emit bun_version "$bun_version"
 help=$(unset BUN_BE_BUN; "$omp_path" --help)
 printf 'help_b64='; printf %s "$help" | base64 | tr -d '\\r\\n'; printf '\\n'
 emit home "$HOME"
+if [ -x "$HOME/.config/herdr/scripts/heavy_slot.py" ]; then emit heavy_slot 1; else emit heavy_slot 0; fi
 if ! cd -- ${posixQuote(cwd)} 2>/dev/null; then
   printf 'cwd_error=missing\\n'
   exit 0
 fi
+${exec ? `disabled_providers=$(unset BUN_BE_BUN; "$omp_path" config get disabledProviders --json)
+disabled_providers=$(printf %s "$disabled_providers" | env BUN_BE_BUN=1 "$omp_path" -e 'const value = await Bun.stdin.json(); if (!Array.isArray(value.value)) throw new Error("invalid disabledProviders"); console.log(JSON.stringify(value.value));')
+printf 'disabled_providers_json_b64='; printf %s "$disabled_providers" | base64 | tr -d '\\r\\n'; printf '\\n'` : ""}
 cwd_real=$(pwd -P)
 emit cwd_real "$cwd_real"
 revision=
@@ -103,12 +109,20 @@ export function parseProbe(stdout: string): ProbeResult {
   }
   const count = values.dirty_count ?? "";
   if (count !== "" && (!/^\d+$/.test(count) || !Number.isSafeInteger(Number(count)))) throw new Error("invalid_probe: invalid dirty_count");
+  if (values.heavy_slot !== undefined && values.heavy_slot !== "0" && values.heavy_slot !== "1") throw new Error("invalid_probe: invalid heavy_slot");
+  let disabledProviders: unknown[] = [];
+  if (values.disabled_providers_json !== undefined) {
+    try { disabledProviders = JSON.parse(values.disabled_providers_json); } catch { throw new Error("invalid_probe: invalid disabled_providers_json"); }
+    if (!Array.isArray(disabledProviders)) throw new Error("invalid_probe: disabled_providers_json must be an array");
+  }
   return {
     ompPath: values.omp_path, ompVersion: values.omp_version, bunVersion: values.bun_version,
     help: values.help, home: values.home, cwdReal: missing ? null : values.cwd_real,
     ...(missing ? { cwdError: "missing" as const } : {}), revision: values.revision ?? "", branch: values.branch ?? "",
     dirtyCount: count === "" ? null : Number(count), runDir: values.run_dir ?? "",
     runDirSource: values.run_dir_source === "agent_work" ? "agent_work" : "fallback",
+    heavySlot: values.heavy_slot === "1",
+    disabledProviders,
   };
 }
 

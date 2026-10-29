@@ -10,6 +10,7 @@ export interface HostConfig {
   sshAlias: string;
   defaultRole?: RemoteRole;
   allowedCwdRoots?: string[];
+  allowExec?: boolean;
 }
 
 export interface HostsConfig {
@@ -67,10 +68,14 @@ export function loadConfig(configPath = process.env.OMP_REMOTE_SUBTASK_CONFIG ??
   for (const [name, rawHost] of Object.entries(object(root.hosts, "hosts"))) {
     if (!name || /[\0\r\n]/.test(name)) invalid("host names must be nonempty single-line strings");
     const host = object(rawHost, `hosts.${name}`);
-    keys(host, ["sshAlias", "defaultRole", "allowedCwdRoots"], `hosts.${name}`);
+    keys(host, ["sshAlias", "defaultRole", "allowedCwdRoots", "allowExec"], `hosts.${name}`);
     if (typeof host.sshAlias !== "string") invalid(`hosts.${name}.sshAlias must be a string`);
     validateSshAlias(host.sshAlias);
-    const parsed: HostConfig = { sshAlias: host.sshAlias };
+    const parsed: HostConfig = { sshAlias: host.sshAlias, allowExec: false };
+    if (host.allowExec !== undefined) {
+      if (typeof host.allowExec !== "boolean") invalid(`hosts.${name}.allowExec must be a boolean`);
+      parsed.allowExec = host.allowExec;
+    }
     if (host.defaultRole !== undefined) {
       if (typeof host.defaultRole !== "string" || !REMOTE_ROLES.includes(host.defaultRole as RemoteRole)) invalid(`hosts.${name}.defaultRole is invalid`);
       parsed.defaultRole = host.defaultRole as RemoteRole;

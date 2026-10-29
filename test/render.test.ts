@@ -102,6 +102,48 @@ test('call, partial and final renderers fit terminal cells and expose key fields
   expect(fitLine('e\u0301🙂한글', 4)).not.toContain('\ufffd');
 });
 
+test('read mode preserves the existing call, header and plain-text presentation', () => {
+  const options = { isPartial: false, expanded: false };
+  const args = { host: 'mac-studio', role: 'smol', task: 'Inspect the config' };
+  const expectedCall = ['mac-studio · smol · Inspect the config'];
+  expect(renderCall(args, options).render(160)).toEqual(expectedCall);
+  expect(renderCall({ ...args, mode: 'read' }, options).render(160)).toEqual(expectedCall);
+  const progress = createProgress('read-1', 'mac-studio', 'smol', 1000);
+  expect(progress.mode).toBe('read');
+  expect(progressText(progress)).toStartWith('mac-studio · smol · probe · resolving model · 0ms · 0 tools');
+  const partial = renderResult({ content: [], details: { progress } }, { ...options, isPartial: true });
+  expect(partial.render(160)[0]).toBe('mac-studio · smol · probe · resolving model');
+  const result = { content: [{ type: 'text', text: 'Answer' }], details: { host: 'mac-studio', role: 'smol' as const, status: 'completed' as const } };
+  expect(renderResult(result, options).render(160)[0]).toBe('completed · mac-studio · smol · resolving model');
+  expect(renderResult({ ...result, details: { ...result.details, mode: 'read' } }, options).render(160)).toEqual(renderResult(result, options).render(160));
+});
+
+test('exec mode is explicit in calls, partial and final headers and plain-text fallback', () => {
+  const progress = createProgress('exec-1', 'mac-studio', 'smol', 1000, 'exec');
+  const snapshot = progressSnapshot(progress, 'running', 'smol', 1200);
+  expect(snapshot.mode).toBe('exec');
+  expect(progressText(snapshot)).toStartWith('[exec] mac-studio · smol · running');
+  const options = { isPartial: false, expanded: false };
+  const call = renderCall({ host: 'mac-studio', role: 'smol', task: 'Edit config', mode: 'exec' }, options, theme);
+  expect(call.render(160).map(stripVTControlCharacters).join('\n')).toBe('[exec] mac-studio · smol · Edit config');
+  expect(stripVTControlCharacters(call.render(12)[0])).toStartWith('[exec]');
+  const partial = renderResult({ content: [], details: { progress: snapshot } }, { ...options, isPartial: true }, theme);
+  expect(stripVTControlCharacters(partial.render(160)[0])).toStartWith('[exec] mac-studio · smol · running');
+  const result = { content: [{ type: 'text', text: 'Changed /remote/project/config.json' }], details: {
+    mode: 'exec' as const, status: 'completed' as const, host: 'mac-studio', role: 'smol' as const,
+  } };
+  const collapsed = renderResult(result, options, theme);
+  const expanded = renderResult(result, { ...options, expanded: true });
+  for (const view of [collapsed, expanded]) {
+    expect(stripVTControlCharacters(view.render(160)[0])).toStartWith('[exec] completed · mac-studio · smol');
+  }
+  const failed = renderResult({ content: [{ type: 'text', text: 'remote_task could not start: denied' }], details: { mode: 'exec', status: 'failed' }, isError: true }, options);
+  expect(failed.render(160)[0]).toStartWith('[exec] failed');
+  for (const width of [0, 1, 8, 20, 40, 80, 160]) {
+    for (const view of [call, partial, collapsed, expanded, failed]) assertWidths(view.render(width), width);
+  }
+});
+
 test('early failures without run details still render the error', () => {
   const view = renderResult({ content: [{ type: 'text', text: 'remote_task could not start: no hosts' }], isError: true }, { isPartial: false, expanded: false });
   expect(view.render(100).join('\n')).toContain('no hosts');

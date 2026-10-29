@@ -179,9 +179,9 @@ export function decide(state: RunState): RunDecision {
     ? "awaiting_session_settled" : "awaiting_prompt_result" };
 }
 
-const INHERITED_TOOLS: Record<string, true> = { read: true, grep: true, glob: true, write: true };
+const INHERITED_TOOLS = ['read', 'grep', 'glob', 'write'] as const;
 
-export function checkInheritedTools(names: readonly string[]): { ok: boolean; unexpected: string[] } {
-  const unexpected = names.filter(name => !Object.hasOwn(INHERITED_TOOLS, name));
+export function checkInheritedTools(names: readonly string[], allowed: readonly string[] = INHERITED_TOOLS): { ok: boolean; unexpected: string[] } {
+  const unexpected = names.filter(name => !allowed.includes(name));
   return { ok: unexpected.length === 0, unexpected };
 }
