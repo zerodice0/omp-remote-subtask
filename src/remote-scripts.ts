@@ -13,7 +13,6 @@ export interface ProbeResult {
   runDir: string;
   runDirSource: "agent_work" | "fallback";
   home: string;
-  heavySlot: boolean;
   disabledProviders: unknown[];
 }
 
@@ -40,7 +39,6 @@ emit bun_version "$bun_version"
 help=$(unset BUN_BE_BUN; "$omp_path" --help)
 printf 'help_b64='; printf %s "$help" | base64 | tr -d '\\r\\n'; printf '\\n'
 emit home "$HOME"
-if [ -x "$HOME/.config/herdr/scripts/heavy_slot.py" ]; then emit heavy_slot 1; else emit heavy_slot 0; fi
 if ! cd -- ${posixQuote(cwd)} 2>/dev/null; then
   printf 'cwd_error=missing\\n'
   exit 0
@@ -109,7 +107,6 @@ export function parseProbe(stdout: string): ProbeResult {
   }
   const count = values.dirty_count ?? "";
   if (count !== "" && (!/^\d+$/.test(count) || !Number.isSafeInteger(Number(count)))) throw new Error("invalid_probe: invalid dirty_count");
-  if (values.heavy_slot !== undefined && values.heavy_slot !== "0" && values.heavy_slot !== "1") throw new Error("invalid_probe: invalid heavy_slot");
   let disabledProviders: unknown[] = [];
   if (values.disabled_providers_json !== undefined) {
     try { disabledProviders = JSON.parse(values.disabled_providers_json); } catch { throw new Error("invalid_probe: invalid disabled_providers_json"); }
@@ -121,7 +118,6 @@ export function parseProbe(stdout: string): ProbeResult {
     ...(missing ? { cwdError: "missing" as const } : {}), revision: values.revision ?? "", branch: values.branch ?? "",
     dirtyCount: count === "" ? null : Number(count), runDir: values.run_dir ?? "",
     runDirSource: values.run_dir_source === "agent_work" ? "agent_work" : "fallback",
-    heavySlot: values.heavy_slot === "1",
     disabledProviders,
   };
 }

@@ -47,11 +47,11 @@ export const MCP_DISCOVERY_PROVIDERS = ['native', 'omp-plugins', 'claude', 'agen
 export function execOverlay(disabledProviders: unknown[] = []): string {
   return EXEC_OVERLAY_YAML + `disabledProviders: ${JSON.stringify([...new Set([...disabledProviders, ...MCP_DISCOVERY_PROVIDERS])])}\n`;
 }
-export function execNote(runDir: string, runId: string, heavySlot: boolean): string {
+export function execNote(runDir: string): string {
   return [
     'You are running an opt-in remote exec subtask launched by another omp session through remote_task.',
     `Work only inside the cwd and ${runDir}/work. TMPDIR is ${runDir}/tmp; never use /tmp. Create scratch directories with mktemp -d -p ${JSON.stringify(`${runDir}/work`)}.`,
-    ...(heavySlot ? [`Run heavy commands (simulation batches, builds, Playwright/browsers, bulk image processing) through ~/.config/herdr/scripts/heavy_slot.py run --label "remote_task ${runId}" -- <cmd>. It may wait for a free slot.`] : []),
+    'Run heavy commands directly. Stop every process you start (browsers/Chrome, Playwright, emulators, dev/test servers, watchers) as soon as the step that needs it ends, including after failure. Check that none remain before your final answer.',
     'Do not git commit/push/checkout/branch/reset/stash. Do not install packages or change global configuration. Do not start servers or background daemons that outlive the command. Do not kill processes you did not start.',
     `Write outputs under ${runDir}/work, or the cwd only when the task asks. Report absolute paths of produced files in your final answer. Results remain files on the remote host and are not copied back automatically.`,
   ].join('\n');
@@ -192,7 +192,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     details.cwd = probe.cwdReal; details.remoteRunDir = probe.runDir; details.remoteOmpVersion = probe.ompVersion;
     details.revision = probe.revision ? { commit: probe.revision, branch: probe.branch, dirtyCount: probe.dirtyCount } : null;
     const exec = details.mode === 'exec';
-    const ompArgs = ['--mode', 'rpc', '--no-ui', '--cwd', probe.cwdReal, '--session-dir', join(probe.runDir, 'sessions'), '--no-title', '--tools', exec ? EXEC_TOOLS.join(',') : 'read,grep,glob', '--no-extensions', '--no-skills', '--no-rules', '--no-prewalk', '--no-lsp', '--no-pty', '--config', join(probe.runDir, 'overlay.yml'), '--append-system-prompt', exec ? execNote(probe.runDir, runId, probe.heavySlot) : READ_ONLY_NOTE, '--model', `@${details.role}`, '--max-time', String(timeoutSeconds)];
+    const ompArgs = ['--mode', 'rpc', '--no-ui', '--cwd', probe.cwdReal, '--session-dir', join(probe.runDir, 'sessions'), '--no-title', '--tools', exec ? EXEC_TOOLS.join(',') : 'read,grep,glob', '--no-extensions', '--no-skills', '--no-rules', '--no-prewalk', '--no-lsp', '--no-pty', '--config', join(probe.runDir, 'overlay.yml'), '--append-system-prompt', exec ? execNote(probe.runDir) : READ_ONLY_NOTE, '--model', `@${details.role}`, '--max-time', String(timeoutSeconds)];
     const flags = supportedFlags(probe.help);
     for (const arg of ompArgs) if (arg.startsWith('--') && !flags.has(arg)) throw new Error(`unsupported_remote_omp: missing ${arg}`);
     if (options.signal?.aborted) throw new Error('aborted_before_launch');

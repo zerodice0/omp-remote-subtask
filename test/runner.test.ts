@@ -19,7 +19,7 @@ const config = { roleTimeoutSeconds: { tiny: 10, smol: 15, explore: 20, slow: 30
 const children: number[] = [];
 const flags = '--mode --no-ui --cwd --session-dir --no-title --tools --no-extensions --no-skills --no-rules --no-prewalk --no-lsp --no-pty --config --append-system-prompt --model --max-time';
 const mcpDiscoveryProviders = ['native', 'omp-plugins', 'claude', 'agent-plugins', 'claude-plugins', 'codex', 'gemini', 'opencode', 'cursor', 'windsurf', 'vscode', 'mcp-json'];
-function localTransport(mode: string, heavySlot?: boolean) {
+function localTransport(mode: string) {
   return (request: TransportRequest) => {
     if (request.kind === 'launch') {
       const launch = request.supervisorConfig!;
@@ -32,14 +32,14 @@ function localTransport(mode: string, heavySlot?: boolean) {
     if (request.kind === 'probe') {
       const runId = request.script.match(/rst-\d{14}-[a-f0-9]{6}/)?.[0];
       if (!runId) throw new Error('run ID missing from probe');
-      output = `omp_path=${executable}\nomp_version=fake-1\nbun_version=1.4\nhelp_b64=${Buffer.from(flags).toString('base64')}\ncwd_real=${scratch}\nrevision=\nbranch=\ndirty_count=\nrun_dir=${join(scratch, runId)}\nrun_dir_source=fallback\nhome=${scratch}\ndisabled_providers_json=["anthropic"]\n${heavySlot === undefined ? '' : `heavy_slot=${heavySlot ? '1' : '0'}\n`}`;
+      output = `omp_path=${executable}\nomp_version=fake-1\nbun_version=1.4\nhelp_b64=${Buffer.from(flags).toString('base64')}\ncwd_real=${scratch}\nrevision=\nbranch=\ndirty_count=\nrun_dir=${join(scratch, runId)}\nrun_dir_source=fallback\nhome=${scratch}\ndisabled_providers_json=["anthropic"]\n`;
     }
     return spawn('/bin/sh', ['-c', `printf %s ${posixQuote(output)}`], { stdio: 'pipe' });
   };
 }
 function options(mode = 'complete'): RunnerOptions { return { config, cwd: process.cwd(), transport: localTransport(mode), graceSeconds: 0.15 }; }
-function execOptions(mode = 'complete', heavySlot?: boolean): RunnerOptions {
-  return { ...options(mode), config: { ...config, hosts: { local: { sshAlias: 'local', allowExec: true } } }, transport: localTransport(mode, heavySlot) };
+function execOptions(mode = 'complete'): RunnerOptions {
+  return { ...options(mode), config: { ...config, hosts: { local: { sshAlias: 'local', allowExec: true } } } };
 }
 function events(localLogDir: string) { return readFileSync(join(localLogDir, 'events.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line)); }
 function assertGone(pid: number) { expect(() => process.kill(pid, 0)).toThrow(); }
@@ -178,13 +178,11 @@ test('exec overlay disables every MCP discovery provider without losing host-dis
 });
 
 test.each([
-  { mode: undefined, heavySlot: undefined },
-  { mode: 'read', heavySlot: true },
-  { mode: 'exec', heavySlot: undefined },
-  { mode: 'exec', heavySlot: false },
-  { mode: 'exec', heavySlot: true },
-] as { mode?: RemoteMode; heavySlot?: boolean }[])('mode $mode selects tools, overlay and note with heavySlot=$heavySlot', async ({ mode, heavySlot }) => {
-  const opts = execOptions('complete', heavySlot);
+  { mode: undefined },
+  { mode: 'read' },
+  { mode: 'exec' },
+] as { mode?: RemoteMode }[])('mode $mode selects tools, overlay and note', async ({ mode }) => {
+  const opts = execOptions();
   const transport = opts.transport!;
   let launch: SupervisorConfig | undefined;
   opts.transport = request => {
@@ -202,15 +200,14 @@ test.each([
   expect(launch!.overlayYaml).toBe(exec ? execOverlay(['anthropic']) : OVERLAY_YAML);
   if (exec) expect(JSON.parse(launch!.overlayYaml.match(/^disabledProviders: (.+)$/m)![1])).toEqual(['anthropic', ...mcpDiscoveryProviders]);
   const note = launch!.ompArgs[launch!.ompArgs.indexOf('--append-system-prompt') + 1];
-  expect(note).toBe(exec ? execNote(launch!.runDir, result.details.runId, heavySlot ?? false) : READ_ONLY_NOTE);
-  expect(note.includes('heavy_slot.py')).toBe(exec && heavySlot === true);
+  expect(note).toBe(exec ? execNote(launch!.runDir) : READ_ONLY_NOTE);
   const sent = events(result.details.localLogDir).filter(event => event.direction === 'sent').map(event => event.value);
   expect(sent.filter(frame => frame.type === 'prompt')).toHaveLength(1);
 });
 
-test.each([false, true])('exec note constrains work, scratch and process behavior (heavySlot=%s)', heavySlot => {
+test('exec note constrains work, scratch and process behavior', () => {
   const runDir = join(scratch, 'run with spaces');
-  const note = execNote(runDir, 'rst-note-unit', heavySlot);
+  const note = execNote(runDir);
   expect(note).toContain(`Work only inside the cwd and ${runDir}/work.`);
   expect(note).toContain(`TMPDIR is ${runDir}/tmp; never use /tmp.`);
   expect(note).toContain(`mktemp -d -p ${JSON.stringify(`${runDir}/work`)}`);
@@ -221,10 +218,10 @@ test.each([false, true])('exec note constrains work, scratch and process behavio
   expect(note).toContain(`Write outputs under ${runDir}/work, or the cwd only when the task asks.`);
   expect(note).toContain('Report absolute paths of produced files');
   expect(note).toContain('not copied back automatically');
-  if (heavySlot) {
-    expect(note).toContain('~/.config/herdr/scripts/heavy_slot.py run --label "remote_task rst-note-unit" -- <cmd>');
-    expect(note).toContain('It may wait for a free slot.');
-  } else expect(note).not.toContain('heavy_slot');
+  expect(note).toContain('Run heavy commands directly.');
+  expect(note).toContain('Stop every process you start (browsers/Chrome, Playwright, emulators, dev/test servers, watchers) as soon as the step that needs it ends, including after failure.');
+  expect(note).toContain('Check that none remain before your final answer.');
+  expect(note).not.toContain(['heavy', 'slot'].join('_'));
 });
 
 test('remote startup stderr fails before sending a prompt', async () => {
