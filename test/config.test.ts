@@ -20,7 +20,7 @@ function config(value: unknown) {
 
 test("strict user config, defaults and host resolution", () => {
   const cfg = config({ hosts: { studio: { sshAlias: "mac-studio", defaultRole: "explore", allowedCwdRoots: ["/Users/test/workspace/./"] } } });
-  expect(cfg.defaultTimeoutSeconds).toBe(600);
+  expect(cfg.roleTimeoutSeconds).toEqual({ tiny: 120, smol: 300, explore: 900, slow: 1800 });
   expect(cfg.maxTimeoutSeconds).toBe(3600);
   expect(resolveHost(cfg, "studio")).toEqual({ sshAlias: "mac-studio", defaultRole: "explore", allowedCwdRoots: ["/Users/test/workspace/"] });
   expect(() => resolveHost(cfg, "other")).toThrow("unknown_host");
@@ -37,9 +37,29 @@ test("rejects unknown keys, wrong types, invalid aliases and roots", () => {
     { hosts: { studio: { sshAlias: "ok", allowedCwdRoots: ["relative"] } } },
     { hosts: { studio: { sshAlias: "ok", allowedCwdRoots: ["/bad\npath"] } } },
     { hosts: { studio: { sshAlias: "ok", allowedCwdRoots: "/root" } } },
-    { hosts: {}, defaultTimeoutSeconds: 0 }, { hosts: {}, maxTimeoutSeconds: 1.5 },
-    { hosts: {}, defaultTimeoutSeconds: 700, maxTimeoutSeconds: 600 },
+    { hosts: {}, roleTimeoutSeconds: null }, { hosts: {}, roleTimeoutSeconds: [] },
+    { hosts: {}, maxTimeoutSeconds: 1.5 },
   ]) expect(() => config(value)).toThrow();
+});
+
+test("merges per-role timeout overrides over the built-in defaults", () => {
+  const cfg = config({ hosts: {}, roleTimeoutSeconds: { tiny: 45.5, slow: 2400 } });
+  expect(cfg.roleTimeoutSeconds).toEqual({ tiny: 45.5, smol: 300, explore: 900, slow: 2400 });
+});
+
+test("rejects unknown timeout roles and the removed global timeout key", () => {
+  expect(() => config({ hosts: {}, roleTimeoutSeconds: { unknown: 10 } })).toThrow('invalid_config: roleTimeoutSeconds: unknown key "unknown"');
+  const removedKey = "default" + "TimeoutSeconds";
+  expect(() => config({ hosts: {}, [removedKey]: 600 })).toThrow(`invalid_config: config: unknown key "${removedKey}"`);
+});
+
+test("rejects invalid or out-of-bounds role timeouts, including merged defaults", () => {
+  for (const value of [0, -1, null, "120", true]) {
+    expect(() => config({ hosts: {}, roleTimeoutSeconds: { tiny: value } })).toThrow("roleTimeoutSeconds.tiny must be a positive number");
+  }
+  expect(() => config({ hosts: {}, roleTimeoutSeconds: { slow: 3601 } })).toThrow("roleTimeoutSeconds.slow must not exceed maxTimeoutSeconds");
+  expect(() => config({ hosts: {}, maxTimeoutSeconds: 1200 })).toThrow("roleTimeoutSeconds.slow must not exceed maxTimeoutSeconds");
+  expect(config({ hosts: {}, maxTimeoutSeconds: 1200, roleTimeoutSeconds: { slow: 1200 } }).roleTimeoutSeconds.slow).toBe(1200);
 });
 
 test("rejects invalid default roles", () => {

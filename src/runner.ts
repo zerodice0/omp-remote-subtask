@@ -9,6 +9,7 @@ import { controlPath, remoteShellCommand, sshArgv } from './ssh.ts';
 import { buildProbeScript, parseProbe, supportedFlags, buildLaunchScript, buildCleanupCheckScript } from './remote-scripts.ts';
 import { LineSplitter, RpcFrameDecoder, negotiate } from './rpc-frames.ts';
 import { createRunState, reduceRunState, decide, type RunEvent, type RunState, type RunStatus } from './run-state.ts';
+import { createProgress, reduceProgress, progressSnapshot, progressText, type RemotePhase, type RemoteProgress, type RemoteToolCall } from './render.ts';
 
 export interface RemoteTaskParams { host: string; cwd: string; task: string; role?: RemoteRole; timeoutSeconds?: number }
 export interface TransportRequest {
@@ -20,7 +21,7 @@ export interface SupervisorConfig {
   deadlineSeconds: number; graceSeconds: number; overlayYaml: string;
 }
 export interface RunnerOptions {
-  signal?: AbortSignal; onUpdate?: (text: string) => void; cwd?: string; config?: HostsConfig;
+  signal?: AbortSignal; onUpdate?: (text: string, details: { progress: RemoteProgress }) => void; cwd?: string; config?: HostsConfig;
   transport?: (request: TransportRequest) => ChildProcess;
   onTransportSpawn?: (child: ChildProcess) => void;
   graceSeconds?: number;
@@ -31,6 +32,7 @@ export interface RemoteTaskDetails {
   role: RemoteRole; actualModel: string | null; thinkingLevel: string | null; usage: RunState['usage'] | null;
   remoteSessionPath: string | null; remoteRunDir: string | null; localLogDir: string;
   cancellationConfirmed: boolean; remoteOmpVersion: string | null; protocolVersion: number | null; durationMs: number;
+  toolCalls: RemoteToolCall[]; totalToolCalls: number;
   inheritance: { tools: string[]; systemPromptChars: number | null; contextTokensBeforePrompt: number | null; model: string | null; contextFilesNote: string } | null;
   supervisor?: RunState['supervisor']; stats?: unknown; postCheck?: { output?: string; error?: string };
   error?: { code: string; message: string };
@@ -97,7 +99,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   const startedAt = Date.now();
   const runId = `rst-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${randomBytes(3).toString('hex')}`;
   const localLogDir = await localLogDirectory(options.cwd ?? process.cwd(), runId);
-  const details: RemoteTaskDetails = { runId, host: params.host, cwd: params.cwd, revision: null, status: 'failed', role: 'explore', actualModel: null, thinkingLevel: null, usage: null, remoteSessionPath: null, remoteRunDir: null, localLogDir, cancellationConfirmed: false, inheritance: null, remoteOmpVersion: null, protocolVersion: null, durationMs: 0 };
+  const details: RemoteTaskDetails = { runId, host: params.host, cwd: params.cwd, revision: null, status: 'failed', role: 'explore', actualModel: null, thinkingLevel: null, usage: null, remoteSessionPath: null, remoteRunDir: null, localLogDir, cancellationConfirmed: false, inheritance: null, remoteOmpVersion: null, protocolVersion: null, durationMs: 0, toolCalls: [], totalToolCalls: 0 };
   const record = (direction: string, value: unknown) => appendFileSync(join(localLogDir, 'events.jsonl'), JSON.stringify({ ts: new Date().toISOString(), direction, value }) + '\n', { mode: 0o600 });
   const transport = options.transport ?? defaultTransport;
   const graceMs = Math.max(10, (options.graceSeconds ?? 10) * 1000);
@@ -109,14 +111,16 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   let transportClosed = false;
   let promptSent = false;
   let completionDecided = false;
-  let phase = 'probe';
+  let phase: RemotePhase = 'probe';
   let lastUpdate = 0;
-  let streamTail = '';
-  const toolNames = new Set<string>();
+  let progress = createProgress(runId, params.host, details.role, startedAt);
+  let progressTimer: NodeJS.Timeout | undefined;
   const update = () => {
-    if (Date.now() - lastUpdate < 500) return;
-    lastUpdate = Date.now();
-    try { options.onUpdate?.(`${phase}${toolNames.size ? ` tools=${[...toolNames].slice(-8).join(',')}` : ''}\n${streamTail.slice(-450)}`.slice(0, 600)); } catch { /* UI updates cannot affect the remote run. */ }
+    const now = Date.now();
+    if (now - lastUpdate < 500) return;
+    lastUpdate = now;
+    const snapshot = progressSnapshot(progress, phase, details.role, now);
+    try { options.onUpdate?.(progressText(snapshot), { progress: snapshot }); } catch { /* UI updates cannot affect the remote run. */ }
   };
   const queue: RunEvent[] = [];
   let wake: (() => void) | undefined;
@@ -137,6 +141,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
       state = reduceRunState(state, { kind: 'abort_requested', reason: 'timeout' });
     }
     state = reduceRunState(state, event);
+    if (event.kind === 'frame') progress = reduceProgress(progress, event.frame, Date.now());
   };
   const send = (frame: object) => {
     if (!child?.stdin?.writable || transportClosed) throw new Error('transport_not_writable');
@@ -153,14 +158,16 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     const host = resolveHost(config, params.host);
     if (!isAbsolute(params.cwd) || /[\0\r\n]/.test(params.cwd)) throw new Error('invalid_cwd: expected an absolute path without NUL/newlines');
     if (typeof params.task !== 'string' || !params.task.trim()) throw new Error('invalid_task');
-    const timeoutSeconds = params.timeoutSeconds ?? config.defaultTimeoutSeconds;
-    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > config.maxTimeoutSeconds) throw new Error(`invalid_timeout: maximum ${config.maxTimeoutSeconds}s`);
     if (params.role !== undefined && !REMOTE_ROLES.includes(params.role)) throw new Error('invalid_role');
     details.role = params.role ?? host.defaultRole ?? 'explore';
     if (!REMOTE_ROLES.includes(details.role)) throw new Error('invalid_role');
+    const timeoutSeconds = params.timeoutSeconds ?? config.roleTimeoutSeconds[details.role];
+    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > config.maxTimeoutSeconds) throw new Error(`invalid_timeout: maximum ${config.maxTimeoutSeconds}s`);
     const reuse = options.transport ? null : controlPath();
     const request = (kind: TransportRequest['kind'], script: string, supervisorConfig?: SupervisorConfig) => transport({ kind, script, argv: sshArgv(host.sshAlias, remoteShellCommand(script), { controlPath: reuse }), supervisorConfig });
     cleanupCheck = () => request('cleanup', buildCleanupCheckScript({ runId }));
+    update();
+    progressTimer = setInterval(update, 500);
     const probe = parseProbe(await capture(request('probe', buildProbeScript({ cwd: params.cwd, runId })), 30000, options.signal));
     if (!probe.cwdReal) throw new Error('remote_cwd_missing');
     if (host.allowedCwdRoots?.length && !host.allowedCwdRoots.some(root => inside(probe.cwdReal!, root))) throw new Error('remote_cwd_not_allowed');
@@ -227,10 +234,6 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
         if (tools.some(name => !Object.hasOwn(ALLOWED_TOOLS, name))) throw new Error('unexpected_remote_tools');
         if (!sentPrompt && !cancelling) { sentPrompt = true; send({ id: 'prompt-1', type: 'prompt', message: params.task }); promptSent = true; reduce({ kind: 'prompt_sent' }); phase = 'running'; phaseDeadline = startedAt + timeoutSeconds * 1000 + 32000; }
       }
-      if (frame?.type === 'tool_execution_start' && typeof frame.toolName === 'string') toolNames.add(frame.toolName);
-      const delta = frame?.assistantMessageEvent;
-      if (delta && typeof delta === 'object' && 'type' in delta && delta.type === 'text_delta' && 'delta' in delta && typeof delta.delta === 'string') streamTail = (streamTail + delta.delta).slice(-600);
-      if (frame?.type === 'message_end') streamTail = state.lastAssistantText.slice(-600);
       update();
       if (cancelling && frame?.type === 'prompt_result' && phase === 'cancel_abort') {
         send({ type: 'remote_subtask_control', op: 'terminate' }); reduce({ kind: 'terminate_requested' }); phase = 'cancel_terminate'; phaseDeadline = Date.now() + terminateWaitMs;
@@ -262,6 +265,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     }
   } finally {
     clearTimeout(localTimer);
+    clearInterval(progressTimer);
     options.signal?.removeEventListener('abort', abort);
   }
   if (child && state.abortRequested && !state.supervisor.exited && cleanupCheck) {
@@ -272,9 +276,11 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   details.status = outcome.status ?? (promptSent ? 'unknown' : 'failed');
   details.cancellationConfirmed = outcome.cancellationConfirmed;
   if (outcome.notStarted) details.notStarted = true;
-  details.actualModel = state.actualModel; details.usage = state.usage;
+  details.actualModel = state.actualModel ?? progress.actualModel; details.usage = state.usage;
   details.supervisor = state.supervisor;
   details.durationMs = Date.now() - startedAt;
+  details.toolCalls = progressSnapshot(progress, phase, details.role, Date.now()).toolCalls;
+  details.totalToolCalls = progress.totalToolCalls;
   const stderrTail = state.supervisor.exited?.stderrTail;
   if (details.status === 'failed' && !promptSent && typeof stderrTail === 'string' && stderrTail.trim()) {
     details.error = { code: 'remote_omp_exited_before_ready', message: `Remote omp exited before the prompt was sent:\n${stderrTail}` };

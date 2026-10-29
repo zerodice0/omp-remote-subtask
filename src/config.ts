@@ -13,7 +13,7 @@ export interface HostConfig {
 }
 
 export interface HostsConfig {
-  defaultTimeoutSeconds: number;
+  roleTimeoutSeconds: Record<RemoteRole, number>;
   maxTimeoutSeconds: number;
   hosts: Record<string, HostConfig>;
 }
@@ -47,10 +47,22 @@ export function loadConfig(configPath = process.env.OMP_REMOTE_SUBTASK_CONFIG ??
     throw new Error(`config_read_error: ${configPath}: ${error instanceof Error ? error.message : String(error)}`);
   }
   const root = object(data, "config");
-  keys(root, ["defaultTimeoutSeconds", "maxTimeoutSeconds", "hosts"], "config");
-  const defaultTimeoutSeconds = seconds(root.defaultTimeoutSeconds, 600, "defaultTimeoutSeconds");
+  keys(root, ["roleTimeoutSeconds", "maxTimeoutSeconds", "hosts"], "config");
   const maxTimeoutSeconds = seconds(root.maxTimeoutSeconds, 3600, "maxTimeoutSeconds");
-  if (defaultTimeoutSeconds > maxTimeoutSeconds) invalid("defaultTimeoutSeconds must not exceed maxTimeoutSeconds");
+  const roleTimeoutSeconds: Record<RemoteRole, number> = { tiny: 120, smol: 300, explore: 900, slow: 1800 };
+  if (root.roleTimeoutSeconds !== undefined) {
+    const overrides = object(root.roleTimeoutSeconds, "roleTimeoutSeconds");
+    keys(overrides, [...REMOTE_ROLES], "roleTimeoutSeconds");
+    for (const role of REMOTE_ROLES) {
+      if (!Object.hasOwn(overrides, role)) continue;
+      const value = overrides[role];
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) invalid(`roleTimeoutSeconds.${role} must be a positive number`);
+      roleTimeoutSeconds[role] = value;
+    }
+  }
+  for (const role of REMOTE_ROLES) {
+    if (roleTimeoutSeconds[role] > maxTimeoutSeconds) invalid(`roleTimeoutSeconds.${role} must not exceed maxTimeoutSeconds`);
+  }
   const hosts: Record<string, HostConfig> = Object.create(null);
   for (const [name, rawHost] of Object.entries(object(root.hosts, "hosts"))) {
     if (!name || /[\0\r\n]/.test(name)) invalid("host names must be nonempty single-line strings");
@@ -72,7 +84,7 @@ export function loadConfig(configPath = process.env.OMP_REMOTE_SUBTASK_CONFIG ??
     }
     hosts[name] = parsed;
   }
-  return { defaultTimeoutSeconds, maxTimeoutSeconds, hosts };
+  return { roleTimeoutSeconds, maxTimeoutSeconds, hosts };
 }
 
 export function resolveHost(config: HostsConfig, name: string): HostConfig {

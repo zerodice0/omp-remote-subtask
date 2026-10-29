@@ -15,7 +15,7 @@ const supervisor = resolve('src/supervisor.mjs');
 const executable = join(scratch, 'fake-omp');
 writeFileSync(executable, `#!/bin/sh\nif [ -n "$BUN_BE_BUN" ]; then exit 98; fi\nexec env BUN_BE_BUN=1 ${posixQuote(process.execPath)} ${posixQuote(fake)} "$@"\n`);
 chmodSync(executable, 0o700);
-const config = { defaultTimeoutSeconds: 20, maxTimeoutSeconds: 60, hosts: { local: { sshAlias: 'local' } } };
+const config = { roleTimeoutSeconds: { tiny: 10, smol: 15, explore: 20, slow: 30 }, maxTimeoutSeconds: 60, hosts: { local: { sshAlias: 'local' } } };
 const children: number[] = [];
 const flags = '--mode --no-ui --cwd --session-dir --no-title --tools --no-extensions --no-skills --no-rules --no-prewalk --no-lsp --no-pty --config --append-system-prompt --model --max-time';
 function localTransport(mode: string) {
@@ -85,6 +85,31 @@ test.each([
   expect(result.details.role).toBe(expected);
   expect(argv).toBeDefined();
   expect(argv!.slice(argv!.indexOf('--model'), argv!.indexOf('--model') + 2)).toEqual(['--model', `@${expected}`]);
+});
+
+test.each([
+  { role: 'slow', defaultRole: 'smol', timeoutSeconds: 45, expected: 45 },
+  { role: 'tiny', defaultRole: 'slow', timeoutSeconds: undefined, expected: 10 },
+  { role: undefined, defaultRole: 'smol', timeoutSeconds: undefined, expected: 15 },
+  { role: undefined, defaultRole: undefined, timeoutSeconds: undefined, expected: 20 },
+] as { role?: RemoteRole; defaultRole?: RemoteRole; timeoutSeconds?: number; expected: number }[])('timeout precedence: $role / $defaultRole / $timeoutSeconds resolves to $expected seconds', async ({ role, defaultRole, timeoutSeconds, expected }) => {
+  const opts = options();
+  opts.config = { ...config, hosts: { local: { sshAlias: 'local', defaultRole } } };
+  const transport = opts.transport!;
+  let deadlineSeconds: number | undefined;
+  let argv: string[] | undefined;
+  opts.transport = request => {
+    if (request.kind === 'launch') {
+      deadlineSeconds = request.supervisorConfig!.deadlineSeconds;
+      argv = request.supervisorConfig!.ompArgs;
+    }
+    return transport(request);
+  };
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Answer locally.', role, timeoutSeconds }, opts);
+  expect(result.details.status).toBe('completed');
+  expect(deadlineSeconds).toBe(expected);
+  expect(argv).toBeDefined();
+  expect(argv!.slice(argv!.indexOf('--max-time'), argv!.indexOf('--max-time') + 2)).toEqual(['--max-time', String(expected)]);
 });
 
 test('rejects invalid runtime roles without starting transport', async () => {

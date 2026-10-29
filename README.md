@@ -20,7 +20,12 @@ Configuration is a user-owned JSON file at `~/.omp/agent/omp-remote-subtask.json
 
 ```json
 {
-  "defaultTimeoutSeconds": 600,
+  "roleTimeoutSeconds": {
+    "tiny": 120,
+    "smol": 300,
+    "explore": 900,
+    "slow": 1800
+  },
   "maxTimeoutSeconds": 3600,
   "hosts": {
     "mac-studio": {
@@ -36,6 +41,8 @@ The tool registers even if configuration is missing or invalid, then returns a c
 
 `defaultRole` is optional and must be one of `tiny`, `smol`, `explore`, or `slow`. A tool call's explicit role takes precedence over the host default; without either, the role is `explore`.
 
+`roleTimeoutSeconds` is optional; its only allowed keys are the four roles, and omitted entries retain the built-in defaults shown above. Each timeout must be a positive number no greater than `maxTimeoutSeconds` (default 3600 seconds), including entries inherited from the built-in defaults. Resolve the role first (explicit tool-call role, host `defaultRole`, then `explore`); an explicit tool-call `timeoutSeconds` overrides that role's configured timeout. Omit `timeoutSeconds` unless the task needs a different bound.
+
 ## Tool contract
 
 ```json
@@ -48,7 +55,7 @@ The tool registers even if configuration is missing or invalid, then returns a c
 }
 ```
 
-`host`, absolute `cwd`, and a nonempty self-contained `task` are required. Optional `role` selects the workload, not a provider or model. Each remote host maps roles to its own configured model and thinking effort through its `modelRoles` settings; mappings may differ per host. The runner passes `--model @role`, letting that host resolve both model and effort. A positive timeout cannot exceed the configured maximum. The extension declares `approval: "exec"`; the calling omp approval policy governs execution.
+`host`, absolute `cwd`, and a nonempty self-contained `task` are required. Optional `role` selects the workload, not a provider or model. Each remote host maps roles to its own configured model and thinking effort through its `modelRoles` settings; mappings may differ per host. The runner passes `--model @role`, letting that host resolve both model and effort. Optional `timeoutSeconds` defaults to the resolved role's timeout; any explicit positive value must not exceed the configured maximum. The extension declares `approval: "exec"`; the calling omp approval policy governs execution.
 
 | Role | Choose for |
 |---|---|
@@ -61,7 +68,15 @@ The selected role must resolve on the remote host. omp's own role fallbacks appl
 
 Before launch the runner probes the remote omp version/help, embedded Bun, real cwd, Git revision/branch/dirty count, and working-storage location. Every requested CLI flag must exist remotely; incompatible versions fail with `unsupported_remote_omp` instead of silently weakening the profile. It negotiates RPC v2 when offered, reads `get_state` before sending exactly one prompt, and waits for both prompt completion and session settlement. It requests final session statistics best-effort, closes stdin, and bounds supervisor shutdown.
 
-Results contain the remote assistant's final text (capped at 60,000 characters with a transcript pointer) and a status footer. `details` includes run ID, host/cwd, revision, status, resolved `role`, `actualModel`, `thinkingLevel` (reported by remote `get_state`, or null), usage, remote session/run paths, local log path, cancellation confirmation, inherited tools/prompt size/context tokens/model, remote omp version, protocol version, duration, and errors when applicable. Statistics and supervisor records are included when received. Progress is throttled to at most twice per second and 600 characters per update.
+Results contain the remote assistant's final text (capped at 60,000 characters with a transcript pointer) and a status footer. `details` includes run ID, host/cwd, revision, status, resolved `role`, `actualModel`, `thinkingLevel` (reported by remote `get_state`, or null), cumulative usage, remote session/run paths, local log path, cancellation confirmation, inherited tools/prompt size/context tokens/model, remote omp version, protocol version, duration, and errors when applicable. Statistics and supervisor records are included when received. `toolCalls` retains the last 50 calls in start order, with short arguments, running/done/error status and duration; `totalToolCalls` counts every call.
+
+### Live progress and result views
+
+The interactive TUI shows the host, role and a short task preview on the call. Live updates show the resolved remote model and thinking effort as soon as startup reports them, phase, elapsed time, tool count, cumulative input/output/cache-read tokens and reported cost. The last six tool calls have status glyphs and durations, followed by up to three lines of the assistant's text tail. Updates are throttled to at most twice per second, including quiet periods; structured `details.progress` carries the same bounded tool list and usage. Only assistant `message_end` frames contribute usage, not repeated `turn_end` records or in-flight estimates.
+
+The collapsed final result shows status, model/effort, duration, total tool count, cost and the first answer lines. Expanding reveals the full returned answer, all retained tool summaries, the remote session path and local log directory. Lines are measured in terminal cells, including CJK/emoji; long answer/path lines wrap in the expanded view. Theme colors are optional. Plain-text progress (a header, last four tool calls and text tail) remains available to non-TUI frontends and the smoke script; `omp -p` receives the ordinary final answer and footer.
+
+This is an extension tool card, not a registered built-in subagent: it creates **no entry in `agent://`, `history://` or `proc://`**, because no documented extension API registers an external agent in those registries. The authoritative remote session transcript stays on the remote host. Local `events.jsonl` mirrors sent commands and received RPC frames, including text deltas and tool events, for replay and diagnosis.
 
 ## Remote inheritance policy
 
@@ -147,14 +162,16 @@ Four-role delegation review (2026-10-29): fresh `omp -p` caller sessions on winm
 | `explore` | gpt-6.1-sol, medium | 106.5 s | 14 | 36,089 / 144,000 / 4,075 | 0.1273 |
 | `slow` | claude-opus-5-5, xhigh | 325.2 s | 63 | 78 / 2,696,783 / 28,757 | 2.0367 |
 
-All four completed and returned the remote answer to the caller. Every caller restated the format requirement inside `task` and none forwarded the unrelated note; each remote session held exactly one user message, equal to `task`. The remote system prompt included the repository's own `AGENTS.md`. Caller conversation, files and earlier tool results are not transferred: `task` is the only caller context. The `slow` run exceeded the 300-second `defaultTimeoutSeconds` used in the example configuration and finished only because the caller set 600 seconds. The `tiny` answer gave the right version but cited `pubspec.yaml:15` instead of line 19.
+All four completed and returned the remote answer to the caller. Every caller restated the format requirement inside `task` and none forwarded the unrelated note; each remote session held exactly one user message, equal to `task`. The remote system prompt included the repository's own `AGENTS.md`. Caller conversation, files and earlier tool results are not transferred: `task` is the only caller context. The `slow` run took 325.2 seconds, exceeding the example configuration's former 300-second global timeout, and finished because the caller set 600 seconds; role defaults now give `slow` 1800 seconds. The `tiny` answer gave the right version but cited `pubspec.yaml:15` instead of line 19.
+
+Interactive TUI progress/result smoke (2026-10-29): a fresh PTY caller on winmini (`openai-codex/gpt-6-luna`, low) invoked `remote_task` once on Studio `couple-calendar`, role `smol`, asking for three rules from `AGENTS.md` and `CLAUDE.md`. The live card displayed `running`, `openai-codex/gpt-6.1-terra · low`, elapsed time, tokens/cost, and `✓ read CLAUDE.md`. The final card displayed `completed`, 15.8 seconds, one tool call, 19.4k input / 115 output / 11.0k cache-read tokens, cost $0 as reported remotely, and three answer lines. Ctrl+O expansion displayed the retained tool list and remote session/local log paths. No approval prompt appeared under the caller's existing policy. The caller was closed after capture; ANSI-stripped partial/final/expanded excerpts and the raw PTY stream were retained in agent-work.
 
 ## Not verified yet
 
 - Runs that reach the `--max-time`/supervisor deadline, and SIGKILL escalation against a child that ignores TERM, on real hosts (covered only by the local fake-omp tests).
 - Network loss where the remote sshd does not notice the drop (e.g. a sleeping laptop or a cut link rather than a killed client): the supervisor relies on stdin EOF, so cleanup then waits for TCP keepalive or the run deadline.
 - Remote hosts other than the two above, Linux remote hosts, and omp versions other than 18.12.6 / 18.13.0.
-- Interactive TUI use (approval prompt, progress rendering, Esc cancellation); only `omp -p` and the smoke script were exercised.
+- Interactive Esc cancellation and a caller policy that displays an execution-approval dialog; the successful PTY smoke used the existing approval policy without a dialog.
 - Retention: run directories under the home-cache fallback (`~/.cache/agent-work/omp-remote-subtask/runs`, used on MacBook and locally when the caller cwd is not a checkout) are not managed by `agent_work.py gc`.
 
 ## License
