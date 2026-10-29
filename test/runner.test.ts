@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { runRemoteTask, type RunnerOptions, type TransportRequest } from '../src/runner.ts';
 import { posixQuote } from '../src/ssh.ts';
+import type { RemoteRole } from '../src/config.ts';
 
 const scratchRoot = execFileSync(join(homedir(), '.config/herdr/scripts/agent_work.py'), ['path', '--name', 'runner-tests'], { encoding: 'utf8' }).trim();
 const scratch = execFileSync('mktemp', ['-d', '-p', scratchRoot], { encoding: 'utf8' }).trim();
@@ -16,7 +17,7 @@ writeFileSync(executable, `#!/bin/sh\nif [ -n "$BUN_BE_BUN" ]; then exit 98; fi\
 chmodSync(executable, 0o700);
 const config = { defaultTimeoutSeconds: 20, maxTimeoutSeconds: 60, hosts: { local: { sshAlias: 'local' } } };
 const children: number[] = [];
-const flags = '--mode --no-ui --cwd --session-dir --no-title --tools --no-extensions --no-skills --no-rules --no-prewalk --no-lsp --no-pty --config --append-system-prompt --model --thinking --max-time';
+const flags = '--mode --no-ui --cwd --session-dir --no-title --tools --no-extensions --no-skills --no-rules --no-prewalk --no-lsp --no-pty --config --append-system-prompt --model --max-time';
 function localTransport(mode: string) {
   return (request: TransportRequest) => {
     if (request.kind === 'launch') {
@@ -48,18 +49,64 @@ function onFixtureReady(child: ChildProcess, action: () => void) {
 afterAll(() => { for (const pid of children) { try { process.kill(pid, 'SIGKILL'); } catch {} } });
 
 test('completed: negotiates, checks inheritance, prompts once and waits for settled', async () => {
-  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Answer locally.', model: 'fake/model:low' }, options());
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Answer locally.', role: 'tiny' }, options());
   expect(result.details.status).toBe('completed');
   expect(result.text).toContain('Local fake answer.');
   expect(result.details.protocolVersion).toBe(2);
   expect(result.details.actualModel).toBe('fake/model');
+  expect(result.details.role).toBe('tiny');
+  expect(result.details.thinkingLevel).toBe('medium');
+  expect(result.details.inheritance.model).toBe('fake/model');
   expect(result.details.inheritance.tools).toEqual(['read', 'grep', 'glob', 'write']);
   expect(result.details.inheritance.contextTokensBeforePrompt).toBe(12);
   expect(result.details.supervisor.exited.groupGone).toBe(true);
+  expect(result.details.supervisor.exited).not.toHaveProperty('stderrTail');
   expect(result.details.stats.cost).toBe(0.001);
   const sent = events(result.details.localLogDir).filter(event => event.direction === 'sent').map(event => event.value);
   expect(sent.filter(frame => frame.type === 'prompt')).toHaveLength(1);
   expect(sent.map(frame => frame.type)).toEqual(['negotiate_protocol', 'get_state', 'prompt', 'get_session_stats']);
+});
+
+test.each([
+  { role: 'slow', defaultRole: 'smol', expected: 'slow' },
+  { role: undefined, defaultRole: 'smol', expected: 'smol' },
+  { role: undefined, defaultRole: undefined, expected: 'explore' },
+] as { role?: RemoteRole; defaultRole?: RemoteRole; expected: RemoteRole }[])('role precedence: $role / $defaultRole resolves to $expected', async ({ role, defaultRole, expected }) => {
+  const opts = options();
+  opts.config = { ...config, hosts: { local: { sshAlias: 'local', defaultRole } } };
+  const transport = opts.transport!;
+  let argv: string[] | undefined;
+  opts.transport = request => {
+    if (request.kind === 'launch') argv = request.supervisorConfig!.ompArgs;
+    return transport(request);
+  };
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Answer locally.', role }, opts);
+  expect(result.details.status).toBe('completed');
+  expect(result.details.role).toBe(expected);
+  expect(argv).toBeDefined();
+  expect(argv!.slice(argv!.indexOf('--model'), argv!.indexOf('--model') + 2)).toEqual(['--model', `@${expected}`]);
+});
+
+test('rejects invalid runtime roles without starting transport', async () => {
+  const opts = options();
+  opts.transport = () => { throw new Error('unexpected_transport'); };
+  for (const role of ['invalid', '', null, 1]) {
+    const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Do not send.', role: role as RemoteRole }, opts);
+    expect(result.details.status).toBe('failed');
+    expect(result.details.notStarted).toBe(true);
+    expect(result.details.error.code).toBe('invalid_role');
+  }
+});
+
+test('remote startup stderr fails before sending a prompt', async () => {
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Do not send.', role: 'slow' }, options('startup-error'));
+  expect(result.details.status).toBe('failed');
+  expect(result.details.notStarted).toBe(true);
+  expect(result.details.error.code).toBe('remote_omp_exited_before_ready');
+  expect(result.details.error.message).toContain('Model "@slow" not found');
+  expect(result.details.thinkingLevel).toBeNull();
+  expect(Buffer.byteLength(result.details.supervisor.exited.stderrTail)).toBeLessThanOrEqual(2048);
+  expect(events(result.details.localLogDir).filter(event => event.direction === 'sent')).toHaveLength(0);
 });
 
 test('signal abort confirms supervisor group cleanup including a grandchild', async () => {

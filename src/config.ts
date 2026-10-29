@@ -3,9 +3,12 @@ import { homedir } from "node:os";
 import { join, posix } from "node:path";
 import { validateSshAlias } from "./ssh.ts";
 
+export const REMOTE_ROLES = ["tiny", "smol", "explore", "slow"] as const;
+export type RemoteRole = typeof REMOTE_ROLES[number];
+
 export interface HostConfig {
   sshAlias: string;
-  defaultModel?: string;
+  defaultRole?: RemoteRole;
   allowedCwdRoots?: string[];
 }
 
@@ -52,13 +55,13 @@ export function loadConfig(configPath = process.env.OMP_REMOTE_SUBTASK_CONFIG ??
   for (const [name, rawHost] of Object.entries(object(root.hosts, "hosts"))) {
     if (!name || /[\0\r\n]/.test(name)) invalid("host names must be nonempty single-line strings");
     const host = object(rawHost, `hosts.${name}`);
-    keys(host, ["sshAlias", "defaultModel", "allowedCwdRoots"], `hosts.${name}`);
+    keys(host, ["sshAlias", "defaultRole", "allowedCwdRoots"], `hosts.${name}`);
     if (typeof host.sshAlias !== "string") invalid(`hosts.${name}.sshAlias must be a string`);
     validateSshAlias(host.sshAlias);
     const parsed: HostConfig = { sshAlias: host.sshAlias };
-    if (host.defaultModel !== undefined) {
-      if (typeof host.defaultModel !== "string" || !/^[A-Za-z0-9._/@-]+(:[a-z]+)?(?![\s\S])/.test(host.defaultModel)) invalid(`hosts.${name}.defaultModel is invalid`);
-      parsed.defaultModel = host.defaultModel;
+    if (host.defaultRole !== undefined) {
+      if (typeof host.defaultRole !== "string" || !REMOTE_ROLES.includes(host.defaultRole as RemoteRole)) invalid(`hosts.${name}.defaultRole is invalid`);
+      parsed.defaultRole = host.defaultRole as RemoteRole;
     }
     if (host.allowedCwdRoots !== undefined) {
       if (!Array.isArray(host.allowedCwdRoots)) invalid(`hosts.${name}.allowedCwdRoots must be an array`);

@@ -4,13 +4,13 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, resolveHost, type HostsConfig } from './config.ts';
+import { loadConfig, resolveHost, REMOTE_ROLES, type HostsConfig, type RemoteRole } from './config.ts';
 import { controlPath, remoteShellCommand, sshArgv } from './ssh.ts';
 import { buildProbeScript, parseProbe, supportedFlags, buildLaunchScript, buildCleanupCheckScript } from './remote-scripts.ts';
 import { LineSplitter, RpcFrameDecoder, negotiate } from './rpc-frames.ts';
 import { createRunState, reduceRunState, decide, type RunEvent, type RunState, type RunStatus } from './run-state.ts';
 
-export interface RemoteTaskParams { host: string; cwd: string; task: string; model?: string; timeoutSeconds?: number }
+export interface RemoteTaskParams { host: string; cwd: string; task: string; role?: RemoteRole; timeoutSeconds?: number }
 export interface TransportRequest {
   kind: 'probe' | 'launch' | 'cleanup'; argv: string[]; script: string;
   supervisorConfig?: SupervisorConfig;
@@ -28,7 +28,7 @@ export interface RunnerOptions {
 export interface RemoteTaskDetails {
   runId: string; host: string; cwd: string; status: RunStatus;
   revision: { commit: string; branch: string; dirtyCount: number | null } | null;
-  actualModel: string | null; usage: RunState['usage'] | null;
+  role: RemoteRole; actualModel: string | null; thinkingLevel: string | null; usage: RunState['usage'] | null;
   remoteSessionPath: string | null; remoteRunDir: string | null; localLogDir: string;
   cancellationConfirmed: boolean; remoteOmpVersion: string | null; protocolVersion: number | null; durationMs: number;
   inheritance: { tools: string[]; systemPromptChars: number | null; contextTokensBeforePrompt: number | null; model: string | null; contextFilesNote: string } | null;
@@ -69,13 +69,6 @@ async function localLogDirectory(cwd: string, runId: string) {
   mkdirSync(path, { recursive: true, mode: 0o700 }); return path;
 }
 function inside(path: string, root: string) { const rel = relative(root, path); return rel === '' || (!rel.startsWith('..' + '/') && rel !== '..' && !isAbsolute(rel)); }
-function modelArgs(model?: string) {
-  if (!model) return [];
-  if (!/^[A-Za-z0-9._/@-]+(:[a-z]+)?$/.test(model)) throw new Error('invalid_model');
-  const [name, thinking] = model.split(':');
-  if (thinking && !['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(thinking)) throw new Error('invalid_thinking_level');
-  return ['--model', name, ...(thinking ? ['--thinking', thinking] : [])];
-}
 function parseRemoteState(value: unknown) {
   if (!value || typeof value !== 'object' || !('dumpTools' in value) || !Array.isArray(value.dumpTools)) throw new Error('invalid_remote_state');
   const tools: string[] = [];
@@ -90,6 +83,7 @@ function parseRemoteState(value: unknown) {
   return {
     inheritance: { tools, systemPromptChars: Array.isArray(systemPrompt) ? systemPrompt.join('\n').length : typeof systemPrompt === 'string' ? systemPrompt.length : null, contextTokensBeforePrompt: contextTokens, model: modelName('model' in value ? value.model : null), contextFilesNote: CONTEXT_NOTE },
     remoteSessionPath: 'sessionFile' in value && typeof value.sessionFile === 'string' ? value.sessionFile : null,
+    thinkingLevel: 'thinkingLevel' in value && typeof value.thinkingLevel === 'string' ? value.thinkingLevel : null,
   };
 }
 function modelName(model: unknown): string | null {
@@ -103,7 +97,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   const startedAt = Date.now();
   const runId = `rst-${new Date().toISOString().replace(/[-:T]/g, '').slice(0, 14)}-${randomBytes(3).toString('hex')}`;
   const localLogDir = await localLogDirectory(options.cwd ?? process.cwd(), runId);
-  const details: RemoteTaskDetails = { runId, host: params.host, cwd: params.cwd, revision: null, status: 'failed', actualModel: null, usage: null, remoteSessionPath: null, remoteRunDir: null, localLogDir, cancellationConfirmed: false, inheritance: null, remoteOmpVersion: null, protocolVersion: null, durationMs: 0 };
+  const details: RemoteTaskDetails = { runId, host: params.host, cwd: params.cwd, revision: null, status: 'failed', role: 'explore', actualModel: null, thinkingLevel: null, usage: null, remoteSessionPath: null, remoteRunDir: null, localLogDir, cancellationConfirmed: false, inheritance: null, remoteOmpVersion: null, protocolVersion: null, durationMs: 0 };
   const record = (direction: string, value: unknown) => appendFileSync(join(localLogDir, 'events.jsonl'), JSON.stringify({ ts: new Date().toISOString(), direction, value }) + '\n', { mode: 0o600 });
   const transport = options.transport ?? defaultTransport;
   const graceMs = Math.max(10, (options.graceSeconds ?? 10) * 1000);
@@ -161,7 +155,9 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     if (typeof params.task !== 'string' || !params.task.trim()) throw new Error('invalid_task');
     const timeoutSeconds = params.timeoutSeconds ?? config.defaultTimeoutSeconds;
     if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > config.maxTimeoutSeconds) throw new Error(`invalid_timeout: maximum ${config.maxTimeoutSeconds}s`);
-    const selectedModelArgs = modelArgs(params.model ?? host.defaultModel);
+    if (params.role !== undefined && !REMOTE_ROLES.includes(params.role)) throw new Error('invalid_role');
+    details.role = params.role ?? host.defaultRole ?? 'explore';
+    if (!REMOTE_ROLES.includes(details.role)) throw new Error('invalid_role');
     const reuse = options.transport ? null : controlPath();
     const request = (kind: TransportRequest['kind'], script: string, supervisorConfig?: SupervisorConfig) => transport({ kind, script, argv: sshArgv(host.sshAlias, remoteShellCommand(script), { controlPath: reuse }), supervisorConfig });
     cleanupCheck = () => request('cleanup', buildCleanupCheckScript({ runId }));
@@ -171,7 +167,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     if (!probe.ompPath || !probe.runDir || !probe.bunVersion) throw new Error('unsupported_remote_omp: missing omp, embedded Bun, or run directory');
     details.cwd = probe.cwdReal; details.remoteRunDir = probe.runDir; details.remoteOmpVersion = probe.ompVersion;
     details.revision = probe.revision ? { commit: probe.revision, branch: probe.branch, dirtyCount: probe.dirtyCount } : null;
-    const ompArgs = ['--mode', 'rpc', '--no-ui', '--cwd', probe.cwdReal, '--session-dir', join(probe.runDir, 'sessions'), '--no-title', '--tools', 'read,grep,glob', '--no-extensions', '--no-skills', '--no-rules', '--no-prewalk', '--no-lsp', '--no-pty', '--config', join(probe.runDir, 'overlay.yml'), '--append-system-prompt', READ_ONLY_NOTE, ...selectedModelArgs, '--max-time', String(timeoutSeconds)];
+    const ompArgs = ['--mode', 'rpc', '--no-ui', '--cwd', probe.cwdReal, '--session-dir', join(probe.runDir, 'sessions'), '--no-title', '--tools', 'read,grep,glob', '--no-extensions', '--no-skills', '--no-rules', '--no-prewalk', '--no-lsp', '--no-pty', '--config', join(probe.runDir, 'overlay.yml'), '--append-system-prompt', READ_ONLY_NOTE, '--model', `@${details.role}`, '--max-time', String(timeoutSeconds)];
     const flags = supportedFlags(probe.help);
     for (const arg of ompArgs) if (arg.startsWith('--') && !flags.has(arg)) throw new Error(`unsupported_remote_omp: missing ${arg}`);
     if (options.signal?.aborted) throw new Error('aborted_before_launch');
@@ -226,6 +222,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
         const remoteState = parseRemoteState(frame.data);
         details.inheritance = remoteState.inheritance;
         details.remoteSessionPath = remoteState.remoteSessionPath;
+        details.thinkingLevel = remoteState.thinkingLevel;
         const tools = remoteState.inheritance.tools;
         if (tools.some(name => !Object.hasOwn(ALLOWED_TOOLS, name))) throw new Error('unexpected_remote_tools');
         if (!sentPrompt && !cancelling) { sentPrompt = true; send({ id: 'prompt-1', type: 'prompt', message: params.task }); promptSent = true; reduce({ kind: 'prompt_sent' }); phase = 'running'; phaseDeadline = startedAt + timeoutSeconds * 1000 + 32000; }
@@ -278,6 +275,10 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   details.actualModel = state.actualModel; details.usage = state.usage;
   details.supervisor = state.supervisor;
   details.durationMs = Date.now() - startedAt;
+  const stderrTail = state.supervisor.exited?.stderrTail;
+  if (details.status === 'failed' && !promptSent && typeof stderrTail === 'string' && stderrTail.trim()) {
+    details.error = { code: 'remote_omp_exited_before_ready', message: `Remote omp exited before the prompt was sent:\n${stderrTail}` };
+  }
   if (!details.error && details.status !== 'completed') {
     const remoteError = typeof state.promptResult?.error === 'string' ? state.promptResult.error : state.promptResponseError;
     const message = details.status === 'unknown'

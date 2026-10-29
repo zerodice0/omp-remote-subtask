@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, appendFileSync, openSync, closeSync } from 'node:fs';
+import { mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, fstatSync, readSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 
@@ -84,7 +84,16 @@ async function finish() {
     } catch (caught) {
       error = String(caught);
     }
-    frame({ event: 'exited', code: exitCode, signal: exitSignal, reason, termSent, killSent, groupGone, ...(error ? { error } : {}) });
+    let stderrTail;
+    try {
+      const fd = openSync(join(runDir, 'omp.stderr.log'), 'r');
+      try {
+        const size = fstatSync(fd).size;
+        const buffer = Buffer.alloc(Math.min(2048, size));
+        stderrTail = buffer.toString('utf8', 0, readSync(fd, buffer, 0, buffer.length, Math.max(0, size - buffer.length)));
+      } finally { closeSync(fd); }
+    } catch (caught) { log({ error: String(caught), source: 'stderr_tail' }); }
+    frame({ event: 'exited', code: exitCode, signal: exitSignal, reason, termSent, killSent, groupGone, ...(error ? { error } : {}), ...(stderrTail ? { stderrTail } : {}) });
     if (stdoutOpen) await new Promise(resolve => process.stdout.write('', resolve));
     process.exit(exitCode === null ? 0 : exitCode);
   })();

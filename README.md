@@ -25,7 +25,7 @@ Configuration is a user-owned JSON file at `~/.omp/agent/omp-remote-subtask.json
   "hosts": {
     "mac-studio": {
       "sshAlias": "mac-studio",
-      "defaultModel": "openai-codex/gpt-6-luna:low",
+      "defaultRole": "explore",
       "allowedCwdRoots": ["/Users/geom-eungom/workspace"]
     }
   }
@@ -34,6 +34,8 @@ Configuration is a user-owned JSON file at `~/.omp/agent/omp-remote-subtask.json
 
 The tool registers even if configuration is missing or invalid, then returns a clear execution error. Its description lists hosts available when the extension loads. Host names are configuration keys; the model cannot supply raw SSH options or credentials. Remote cwd is resolved physically before checking optional allowed roots. These checks constrain requested cwd, not the files a remote process can access.
 
+`defaultRole` is optional and must be one of `tiny`, `smol`, `explore`, or `slow`. A tool call's explicit role takes precedence over the host default; without either, the role is `explore`.
+
 ## Tool contract
 
 ```json
@@ -41,16 +43,25 @@ The tool registers even if configuration is missing or invalid, then returns a c
   "host": "mac-studio",
   "cwd": "/Users/geom-eungom/workspace/project",
   "task": "Read the implementation and explain why request cancellation can race. Do not modify files.",
-  "model": "openai-codex/gpt-6-luna:low",
+  "role": "explore",
   "timeoutSeconds": 600
 }
 ```
 
-`host`, absolute `cwd`, and a nonempty self-contained `task` are required. Optional `model` overrides the host default; supported suffixes are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`. A suffix becomes `--thinking`. A positive timeout cannot exceed the configured maximum. The extension declares `approval: "exec"`; the calling omp approval policy governs execution.
+`host`, absolute `cwd`, and a nonempty self-contained `task` are required. Optional `role` selects the workload, not a provider or model. Each remote host maps roles to its own configured model and thinking effort through its `modelRoles` settings; mappings may differ per host. The runner passes `--model @role`, letting that host resolve both model and effort. A positive timeout cannot exceed the configured maximum. The extension declares `approval: "exec"`; the calling omp approval policy governs execution.
+
+| Role | Choose for |
+|---|---|
+| `tiny` | A single-fact lookup: a version string, or whether a file or setting exists. |
+| `smol` | A small, well-scoped read of one or two named files with a short summary. |
+| `explore` (default) | A multi-file investigation, tracing a code path, or comparing configurations. |
+| `slow` | Hard root-cause analysis or design judgment where a wrong answer is costly; slowest and most expensive. |
+
+The selected role must resolve on the remote host. omp's own role fallbacks apply: Studio has no `slow` entry in `modelRoles`, yet `@slow` resolved to `anthropic/claude-opus-5-5` with `xhigh`. A role that does not resolve at all fails before the prompt is sent, with no model cost; the result includes the remote startup error, such as `Model "@<role>" not found`.
 
 Before launch the runner probes the remote omp version/help, embedded Bun, real cwd, Git revision/branch/dirty count, and working-storage location. Every requested CLI flag must exist remotely; incompatible versions fail with `unsupported_remote_omp` instead of silently weakening the profile. It negotiates RPC v2 when offered, reads `get_state` before sending exactly one prompt, and waits for both prompt completion and session settlement. It requests final session statistics best-effort, closes stdin, and bounds supervisor shutdown.
 
-Results contain the remote assistant's final text (capped at 60,000 characters with a transcript pointer) and a status footer. `details` includes run ID, host/cwd, revision, status, actual model/usage, remote session/run paths, local log path, cancellation confirmation, inherited tools/prompt size/context tokens/model, remote omp version, protocol version, duration, and errors when applicable. Statistics and supervisor records are included when received. Progress is throttled to at most twice per second and 600 characters per update.
+Results contain the remote assistant's final text (capped at 60,000 characters with a transcript pointer) and a status footer. `details` includes run ID, host/cwd, revision, status, resolved `role`, `actualModel`, `thinkingLevel` (reported by remote `get_state`, or null), usage, remote session/run paths, local log path, cancellation confirmation, inherited tools/prompt size/context tokens/model, remote omp version, protocol version, duration, and errors when applicable. Statistics and supervisor records are included when received. Progress is throttled to at most twice per second and 600 characters per update.
 
 ## Remote inheritance policy
 
@@ -62,7 +73,7 @@ The remote process explicitly uses:
 - an overlay disabling autolearn, memory backend, and asynchronous jobs;
 - an appended instruction to investigate read-only and finish with a complete final answer.
 
-Remote account/provider authentication, normal model defaults when no override is supplied, and other settings not overridden above remain inherited. **Context files are inherited from remote cwd ancestors and the remote home.** Studio omp 18.12.6 cannot disable them because its help lacks `--no-context-files`. A task is therefore not a blank-context session. Observed context before the prompt (`get_state.contextUsage`) was 14,936 tokens on Studio (64,229-char system prompt) and 3,668 tokens on MacBook (11,115 chars); these are host observations, not guarantees.
+Remote account/provider authentication and other settings not overridden above remain inherited; model and effort are resolved from the remote host's `modelRoles` for the selected role, not the caller's settings. **Context files are inherited from remote cwd ancestors and the remote home.** Studio omp 18.12.6 cannot disable them because its help lacks `--no-context-files`. A task is therefore not a blank-context session. Observed context before the prompt (`get_state.contextUsage`) was 14,936 tokens on Studio (64,229-char system prompt) and 3,668 tokens on MacBook (11,115 chars); these are host observations, not guarantees.
 
 `write` remains in `get_state.dumpTools` because omp's default `tools.xdev: true` uses it to invoke mounted `xd://` devices, including MCP tools. The overlay denies write so that device execution is not available to the remote model. Do **not** set `tools.xdev: false`: that re-exposes MCP tools at the top level. This policy is not an OS sandbox, and inherited instructions/settings can still affect behavior. The pre-prompt check fails with `unexpected_remote_tools` if the top-level tool list contains anything outside `read`, `grep`, `glob`, and `write`.
 
@@ -92,14 +103,14 @@ BUN_BE_BUN=1 omp test
 BUN_BE_BUN=1 omp run scripts/smoke.ts \
   --host mac-studio --cwd /absolute/remote/project \
   --task 'Read README.md and summarize it without changing files.' \
-  --model openai-codex/gpt-6-luna:low
+  --role tiny
 ```
 
 The smoke prints `details` JSON to stdout and answer/progress to stderr. Optional `--timeout <seconds>`, `--cancel-after <seconds>` or `--drop-after <seconds>` exercise runtime limits, AbortSignal cancellation, or local SSH-process death respectively. Cancel/drop timers start at transport launch. Run those paid real-host checks deliberately; tests use a local fake omp and never contact SSH hosts or model providers.
 
 ## Verified on real hosts
 
-Caller winmini (omp 18.13.3) → Studio (omp 18.12.6) and MacBook (omp 18.13.0), model `openai-codex/gpt-6-luna:low`, 2026-10-29:
+Caller winmini (omp 18.13.3) → Studio (omp 18.12.6) and MacBook (omp 18.13.0), model `openai-codex/gpt-6-luna` with low effort, 2026-10-29:
 
 | Host | Scenario | Status | Duration | Input / cache read / output tokens | Cost (USD) |
 |---|---|---|---|---|---|
@@ -115,6 +126,17 @@ Caller winmini (omp 18.13.3) → Studio (omp 18.12.6) and MacBook (omp 18.13.0),
 After every cancel and drop, `ps` on the remote host showed no process carrying the run ID, and `supervisor.log` recorded `groupGone: true` (reason `terminate` for cancel, `stdin_eof` within about one second for drop). The first Studio cancel attempt exposed a macOS behaviour: `kill(-pgid, 0)` returns `EPERM` for a group that holds only zombies; the supervisor now settles that case with `ps`.
 
 After `omp plugin link .` on winmini with `~/.omp/agent/omp-remote-subtask.json`, a fresh `omp -p` session called `remote_task` against MacBook and printed the remote answer (completed in about 12 s end to end).
+
+Role resolution, observed through RPC `get_state` with `--model @<role>` (no prompt sent):
+
+| Role | Studio (18.12.6) | MacBook (18.13.0) |
+|---|---|---|
+| `tiny` | `openai-codex/gpt-6-luna`, low | `anthropic/claude-haiku-4-5`, minimal |
+| `smol` | `openai-codex/gpt-6.1-terra`, low | `anthropic/claude-sonnet-5-5`, medium |
+| `explore` | `openai-codex/gpt-6.1-sol`, medium | `anthropic/claude-sonnet-5-5`, medium |
+| `slow` | `anthropic/claude-opus-5-5`, xhigh | `anthropic/claude-opus-5-5`, high |
+
+Real role runs: MacBook `tiny` completed with haiku-4-5/minimal in 4.4 s (cost $0.0133), Studio `tiny` completed with gpt-6-luna/low in 5.0 s ($0.0021), and Studio without a role used `explore` and completed with gpt-6.1-sol/medium in 6.5 s ($0.0410).
 
 ## Not verified yet
 

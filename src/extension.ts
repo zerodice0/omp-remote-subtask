@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from '@oh-my-pi/pi-coding-agent';
-import { loadConfig } from './config.ts';
+import { loadConfig, REMOTE_ROLES } from './config.ts';
 import { runRemoteTask } from './runner.ts';
 
 export default function (pi: ExtensionAPI) {
@@ -10,12 +10,12 @@ export default function (pi: ExtensionAPI) {
     label: 'Remote Task',
     approval: 'exec',
     loadMode: 'essential',
-    description: `Run one read-only investigation on a configured SSH host (${hosts}). Requires an absolute remote cwd and a self-contained task. Remote files are not synchronized. Uses the remote user's authentication, context files and model settings. Never retries a lost prompt; unknown means completion or cancellation could not be confirmed.`,
+    description: `Run one read-only investigation on a configured SSH host (${hosts}). Requires an absolute remote cwd and a self-contained task. Remote files are not synchronized. Uses the remote user's authentication and context files. Each host maps workload roles to its own configured model and thinking effort; these differ per host. Actual model and effort are reported in result details. Never retries a lost prompt; unknown means completion or cancellation could not be confirmed.`,
     parameters: pi.zod.object({
       host: pi.zod.string().describe('Configured host name, not an arbitrary SSH target'),
       cwd: pi.zod.string().describe('Absolute remote working directory'),
       task: pi.zod.string().describe('Self-contained read-only investigation and required answer'),
-      model: pi.zod.string().optional().describe('Optional provider/model[:thinking] override'),
+      role: pi.zod.enum(REMOTE_ROLES).optional().describe('Workload role (host default, otherwise explore): tiny = single-fact lookup, such as a version string or whether a file/setting exists; smol = small well-scoped read of one or two named files with a short summary; explore = multi-file investigation, code-path tracing, or config comparison; slow = hard root-cause analysis or design judgment where a wrong answer is costly, slowest and most expensive. The remote host chooses the model and effort for each role.'),
       timeoutSeconds: pi.zod.number().optional().describe('Positive timeout within the configured maximum'),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {

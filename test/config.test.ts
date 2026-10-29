@@ -19,10 +19,10 @@ function config(value: unknown) {
 }
 
 test("strict user config, defaults and host resolution", () => {
-  const cfg = config({ hosts: { studio: { sshAlias: "mac-studio", defaultModel: "openai-codex/gpt-6-luna:low", allowedCwdRoots: ["/Users/test/workspace/./"] } } });
+  const cfg = config({ hosts: { studio: { sshAlias: "mac-studio", defaultRole: "explore", allowedCwdRoots: ["/Users/test/workspace/./"] } } });
   expect(cfg.defaultTimeoutSeconds).toBe(600);
   expect(cfg.maxTimeoutSeconds).toBe(3600);
-  expect(resolveHost(cfg, "studio")).toEqual({ sshAlias: "mac-studio", defaultModel: "openai-codex/gpt-6-luna:low", allowedCwdRoots: ["/Users/test/workspace/"] });
+  expect(resolveHost(cfg, "studio")).toEqual({ sshAlias: "mac-studio", defaultRole: "explore", allowedCwdRoots: ["/Users/test/workspace/"] });
   expect(() => resolveHost(cfg, "other")).toThrow("unknown_host");
   expect(() => resolveHost(cfg, "other")).toThrow("studio");
   expect(() => resolveHost(cfg, "toString")).toThrow("unknown_host");
@@ -37,10 +37,15 @@ test("rejects unknown keys, wrong types, invalid aliases and roots", () => {
     { hosts: { studio: { sshAlias: "ok", allowedCwdRoots: ["relative"] } } },
     { hosts: { studio: { sshAlias: "ok", allowedCwdRoots: ["/bad\npath"] } } },
     { hosts: { studio: { sshAlias: "ok", allowedCwdRoots: "/root" } } },
-    { hosts: { studio: { sshAlias: "ok", defaultModel: "model;id" } } },
     { hosts: {}, defaultTimeoutSeconds: 0 }, { hosts: {}, maxTimeoutSeconds: 1.5 },
     { hosts: {}, defaultTimeoutSeconds: 700, maxTimeoutSeconds: 600 },
   ]) expect(() => config(value)).toThrow();
+});
+
+test("rejects invalid default roles", () => {
+  for (const defaultRole of ["unknown", "@explore", "", 1, null]) {
+    expect(() => config({ hosts: { studio: { sshAlias: "ok", defaultRole } } })).toThrow("invalid_config: hosts.studio.defaultRole is invalid");
+  }
 });
 
 test("config environment override and actionable read errors", () => {

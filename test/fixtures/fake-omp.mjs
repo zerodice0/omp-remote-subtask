@@ -14,6 +14,11 @@ if (process.argv[2] === '--transport') {
 } else {
   const send = frame => process.stdout.write(JSON.stringify(frame) + '\n');
   const mode = process.env.FAKE_OMP_MODE ?? 'complete';
+  if (mode === 'startup-error') {
+    const role = process.argv[process.argv.indexOf('--model') + 1];
+    process.stderr.write('.'.repeat(4096) + `\nModel "${role}" not found\n`);
+    process.exit(1);
+  }
   // The executable wrapper checks the supervisor removed BUN_BE_BUN before selecting Bun.
   delete process.env.BUN_BE_BUN;
   const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
@@ -37,7 +42,7 @@ if (process.argv[2] === '--transport') {
     const command = JSON.parse(line);
     const response = data => send({ type: 'response', id: command.id, command: command.type, success: true, data });
     if (command.type === 'negotiate_protocol') response({ protocolVersion: 2 });
-    else if (command.type === 'get_state') response({ dumpTools: (mode === 'bad-tools' ? ['read', 'bash'] : ['read', 'grep', 'glob', 'write']).map(name => ({ name })), systemPrompt: ['Inherited context'], contextUsage: { tokens: 12 }, model: { provider: 'fake', id: 'model' }, sessionFile: process.cwd() + '/fake-session.jsonl' });
+    else if (command.type === 'get_state') response({ dumpTools: (mode === 'bad-tools' ? ['read', 'bash'] : ['read', 'grep', 'glob', 'write']).map(name => ({ name })), systemPrompt: ['Inherited context'], contextUsage: { tokens: 12 }, model: { provider: 'fake', id: 'model' }, thinkingLevel: 'medium', sessionFile: process.cwd() + '/fake-session.jsonl' });
     else if (command.type === 'prompt') {
       active = true;
       response({});
