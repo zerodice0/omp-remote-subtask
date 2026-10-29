@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, writeFileSync, appendFileSync, openSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
@@ -38,15 +38,23 @@ process.stdout.on('error', error => {
   void shutdown('stdout_closed');
 });
 child.stdin.on('error', () => {});
+// macOS reports EPERM from kill(-pgid, 0) while the group holds only zombies, so a
+// non-ESRCH answer is settled by listing live (non-zombie) members of the group.
 function groupExists() {
   if (!pgid) return false;
-  try { process.kill(-pgid, 0); return true; }
-  catch (error) { if (error.code === 'ESRCH') return false; throw error; }
+  try { process.kill(-pgid, 0); }
+  catch (error) { if (error.code === 'ESRCH') return false; if (error.code !== 'EPERM') throw error; }
+  const listing = spawnSync('ps', ['-A', '-o', 'pgid=,stat='], { encoding: 'utf8' });
+  if (listing.status !== 0) throw new Error(`ps failed: ${listing.stderr || listing.status}`);
+  return listing.stdout.split('\n').some(row => {
+    const [group, stat] = row.trim().split(/\s+/);
+    return Number(group) === pgid && stat !== undefined && !stat.startsWith('Z');
+  });
 }
 function signalGroup(signal) {
   if (!pgid) return;
   try { process.kill(-pgid, signal); if (signal === 'SIGTERM') termSent = true; else killSent = true; }
-  catch (error) { if (error.code !== 'ESRCH') log({ error: String(error), signal }); }
+  catch (error) { if (error.code !== 'ESRCH' && error.code !== 'EPERM') log({ error: String(error), signal }); }
 }
 async function waitUntil(predicate, milliseconds) {
   const until = Date.now() + milliseconds;
@@ -59,17 +67,24 @@ async function finish() {
     clearTimeout(deadline);
     input.close();
     process.stdin.pause();
-    if (groupExists()) {
-      signalGroup('SIGTERM');
-      if (!await waitUntil(() => !groupExists(), graceMs)) {
-        signalGroup('SIGKILL');
-        await waitUntil(() => !groupExists(), graceMs);
+    let groupGone = false;
+    let error;
+    try {
+      if (groupExists()) {
+        signalGroup('SIGTERM');
+        if (!await waitUntil(() => !groupExists(), graceMs)) {
+          signalGroup('SIGKILL');
+          await waitUntil(() => !groupExists(), graceMs);
+        }
       }
+      // Descendants may retain stdout after their parent exits. Kill the group first,
+      // then drain the child's final output before placing the exit frame after it.
+      await waitUntil(() => child.stdout.readableEnded || child.stdout.destroyed, graceMs);
+      groupGone = !groupExists();
+    } catch (caught) {
+      error = String(caught);
     }
-    // Descendants may retain stdout after their parent exits. Kill the group first,
-    // then drain the child's final output before placing the exit frame after it.
-    await waitUntil(() => child.stdout.readableEnded || child.stdout.destroyed, graceMs);
-    frame({ event: 'exited', code: exitCode, signal: exitSignal, reason, termSent, killSent, groupGone: !groupExists() });
+    frame({ event: 'exited', code: exitCode, signal: exitSignal, reason, termSent, killSent, groupGone, ...(error ? { error } : {}) });
     if (stdoutOpen) await new Promise(resolve => process.stdout.write('', resolve));
     process.exit(exitCode === null ? 0 : exitCode);
   })();
@@ -100,7 +115,7 @@ input.on('line', line => {
   let parsed;
   try { parsed = JSON.parse(line); } catch {}
   if (parsed?.type === 'remote_subtask_control') {
-    if (parsed.op === 'terminate') void shutdown('terminate', true);
+    if (parsed.op === 'terminate') void shutdown('terminate');
     return;
   }
   if (!shuttingDown && child.stdin.writable && !child.stdin.write(line + '\n')) {

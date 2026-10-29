@@ -31,14 +31,14 @@ export interface RemoteTaskDetails {
   actualModel: string | null; usage: RunState['usage'] | null;
   remoteSessionPath: string | null; remoteRunDir: string | null; localLogDir: string;
   cancellationConfirmed: boolean; remoteOmpVersion: string | null; protocolVersion: number | null; durationMs: number;
-  inheritance: { tools: string[]; systemPromptChars: number | null; contextTokensBeforePrompt: number | null; model: unknown; contextFilesNote: string } | null;
+  inheritance: { tools: string[]; systemPromptChars: number | null; contextTokensBeforePrompt: number | null; model: string | null; contextFilesNote: string } | null;
   supervisor?: RunState['supervisor']; stats?: unknown; postCheck?: { output?: string; error?: string };
   error?: { code: string; message: string };
   notStarted?: true;
 }
 export const READ_ONLY_NOTE = 'You are running as a remote read-only subtask launched by another omp session through remote_task. Do not modify files. Investigate with read/grep/glob and finish with a final answer that fully states the result.';
 export const OVERLAY_YAML = 'autolearn:\n  enabled: false\nmemory:\n  backend: off\nasync:\n  enabled: false\ntools:\n  approval:\n    write: deny\n    edit: deny\n    bash: deny\n    eval: deny\n    ast_edit: deny\n    task: deny\n    browser: deny\n';
-const CONTEXT_NOTE = 'Context files are inherited from the remote cwd ancestry and home; this profile cannot disable them on omp 18.12.6.';
+const CONTEXT_NOTE = 'Context files are inherited from the remote cwd ancestry and home; this profile does not disable them.';
 const SUPERVISOR_SOURCE = readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'supervisor.mjs'), 'utf8');
 const ALLOWED_TOOLS: Record<string, true> = { read: true, grep: true, glob: true, write: true };
 const defaultTransport = ({ argv }: TransportRequest) => spawn(argv[0], argv.slice(1), { stdio: 'pipe' });
@@ -88,9 +88,15 @@ function parseRemoteState(value: unknown) {
   const context = 'contextUsage' in value ? value.contextUsage : null;
   const contextTokens = context && typeof context === 'object' && 'tokens' in context && typeof context.tokens === 'number' ? context.tokens : null;
   return {
-    inheritance: { tools, systemPromptChars: Array.isArray(systemPrompt) ? systemPrompt.join('\n').length : typeof systemPrompt === 'string' ? systemPrompt.length : null, contextTokensBeforePrompt: contextTokens, model: 'model' in value ? value.model : null, contextFilesNote: CONTEXT_NOTE },
+    inheritance: { tools, systemPromptChars: Array.isArray(systemPrompt) ? systemPrompt.join('\n').length : typeof systemPrompt === 'string' ? systemPrompt.length : null, contextTokensBeforePrompt: contextTokens, model: modelName('model' in value ? value.model : null), contextFilesNote: CONTEXT_NOTE },
     remoteSessionPath: 'sessionFile' in value && typeof value.sessionFile === 'string' ? value.sessionFile : null,
   };
+}
+function modelName(model: unknown): string | null {
+  if (!model || typeof model !== 'object') return null;
+  const provider = 'provider' in model && typeof model.provider === 'string' ? model.provider : null;
+  const id = 'id' in model && typeof model.id === 'string' ? model.id : null;
+  return id ? (provider ? `${provider}/${id}` : id) : null;
 }
 
 export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOptions = {}) {
@@ -101,6 +107,8 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   const record = (direction: string, value: unknown) => appendFileSync(join(localLogDir, 'events.jsonl'), JSON.stringify({ ts: new Date().toISOString(), direction, value }) + '\n', { mode: 0o600 });
   const transport = options.transport ?? defaultTransport;
   const graceMs = Math.max(10, (options.graceSeconds ?? 10) * 1000);
+  // The supervisor's terminate path is up to three grace periods: drain, TERM, KILL.
+  const terminateWaitMs = graceMs * 3 + 2000;
   let state = createRunState();
   let child: ChildProcess | undefined;
   let cleanupCheck: (() => ChildProcess) | undefined;
@@ -189,7 +197,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
       const event = await next(Math.max(0, phaseDeadline - Date.now()));
       if (!event) {
         if (phase === 'stats') break;
-        if (phase === 'cancel_abort') { send({ type: 'remote_subtask_control', op: 'terminate' }); reduce({ kind: 'terminate_requested' }); phase = 'cancel_terminate'; phaseDeadline = Date.now() + graceMs; continue; }
+        if (phase === 'cancel_abort') { send({ type: 'remote_subtask_control', op: 'terminate' }); reduce({ kind: 'terminate_requested' }); phase = 'cancel_terminate'; phaseDeadline = Date.now() + terminateWaitMs; continue; }
         if (phase === 'cancel_terminate') break;
         enqueue(promptSent ? { kind: 'abort_requested', reason: 'timeout' } : { kind: 'local_error', code: 'rpc_startup_timeout', message: 'Remote RPC startup timed out' });
         continue;
@@ -228,7 +236,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
       if (frame?.type === 'message_end') streamTail = state.lastAssistantText.slice(-600);
       update();
       if (cancelling && frame?.type === 'prompt_result' && phase === 'cancel_abort') {
-        send({ type: 'remote_subtask_control', op: 'terminate' }); reduce({ kind: 'terminate_requested' }); phase = 'cancel_terminate'; phaseDeadline = Date.now() + graceMs;
+        send({ type: 'remote_subtask_control', op: 'terminate' }); reduce({ kind: 'terminate_requested' }); phase = 'cancel_terminate'; phaseDeadline = Date.now() + terminateWaitMs;
       }
       if (frame?.type === 'remote_subtask_supervisor' && frame.event === 'exited') break;
       if (frame?.type === 'response' && frame.id === 'stats-1') { details.stats = frame.success ? frame.data : { error: frame.error }; break; }

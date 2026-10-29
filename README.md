@@ -62,7 +62,7 @@ The remote process explicitly uses:
 - an overlay disabling autolearn, memory backend, and asynchronous jobs;
 - an appended instruction to investigate read-only and finish with a complete final answer.
 
-Remote account/provider authentication, normal model defaults when no override is supplied, and other settings not overridden above remain inherited. **Context files are inherited from remote cwd ancestors and the remote home.** Studio omp 18.12.6 cannot disable them because its help lacks `--no-context-files`. A task is therefore not a blank-context session. Observed baseline context was approximately 24.8k tokens on Studio and 6.1k on MacBook; these are host observations, not guarantees.
+Remote account/provider authentication, normal model defaults when no override is supplied, and other settings not overridden above remain inherited. **Context files are inherited from remote cwd ancestors and the remote home.** Studio omp 18.12.6 cannot disable them because its help lacks `--no-context-files`. A task is therefore not a blank-context session. Observed context before the prompt (`get_state.contextUsage`) was 14,936 tokens on Studio (64,229-char system prompt) and 3,668 tokens on MacBook (11,115 chars); these are host observations, not guarantees.
 
 `write` remains in `get_state.dumpTools` because omp's default `tools.xdev: true` uses it to invoke mounted `xd://` devices, including MCP tools. The overlay denies write so that device execution is not available to the remote model. Do **not** set `tools.xdev: false`: that re-exposes MCP tools at the top level. This policy is not an OS sandbox, and inherited instructions/settings can still affect behavior. The pre-prompt check fails with `unexpected_remote_tools` if the top-level tool list contains anything outside `read`, `grep`, `glob`, and `write`.
 
@@ -97,9 +97,30 @@ BUN_BE_BUN=1 omp run scripts/smoke.ts \
 
 The smoke prints `details` JSON to stdout and answer/progress to stderr. Optional `--timeout <seconds>`, `--cancel-after <seconds>` or `--drop-after <seconds>` exercise runtime limits, AbortSignal cancellation, or local SSH-process death respectively. Cancel/drop timers start at transport launch. Run those paid real-host checks deliberately; tests use a local fake omp and never contact SSH hosts or model providers.
 
+## Verified on real hosts
+
+Caller winmini (omp 18.13.3) → Studio (omp 18.12.6) and MacBook (omp 18.13.0), model `openai-codex/gpt-6-luna:low`, 2026-10-29:
+
+| Host | Scenario | Status | Duration | Input / cache read / output tokens | Cost (USD) |
+|---|---|---|---|---|---|
+| Studio | read-only answer | completed | 6.9 s | 19,777 / 26,112 / 69 | 0.0023 |
+| Studio | cancel after 12 s | aborted, `cancellationConfirmed` | 12.5 s | 27,042 / 81,152 / 193 | 0.0036 |
+| Studio | SSH client killed after 10 s | unknown, one prompt sent | 10.4 s | 19,328 / 11,008 / 75 | 0.0021 |
+| Studio | write attempt | completed; write blocked by policy, no file | 9.4 s | 15,451 / 15,104 / 83 | 0.0017 |
+| MacBook | read-only answer | completed | 8.6 s | 8,635 / 3,584 / 67 | 0.0009 |
+| MacBook | cancel after 12 s | aborted, `cancellationConfirmed` | 14.0 s | 6,941 / 7,296 / 579 | 0.0011 |
+| MacBook | SSH client killed after 6 s | unknown, one prompt sent | 8.7 s | 950 / 2,816 / 37 | 0.0001 |
+| MacBook | write attempt | completed; write blocked by policy, no file | 6.0 s | 4,069 / 3,584 / 85 | 0.0005 |
+
+After every cancel and drop, `ps` on the remote host showed no process carrying the run ID, and `supervisor.log` recorded `groupGone: true` (reason `terminate` for cancel, `stdin_eof` within about one second for drop). The first Studio cancel attempt exposed a macOS behaviour: `kill(-pgid, 0)` returns `EPERM` for a group that holds only zombies; the supervisor now settles that case with `ps`.
+
 ## Not verified yet
 
-Real-remote model smoke results are intentionally not claimed here. The main session will record host/model, completion, cancellation and transport-drop evidence after running those checks. In particular, real-provider read-only approval enforcement, actual context costs, cross-version remote operation, and network-loss cleanup confirmation remain to be verified with paid real-remote runs. The local fixture tests are not proof of those behaviors.
+- Runs that reach the `--max-time`/supervisor deadline, and SIGKILL escalation against a child that ignores TERM, on real hosts (covered only by the local fake-omp tests).
+- Network loss where the remote sshd does not notice the drop (e.g. a sleeping laptop or a cut link rather than a killed client): the supervisor relies on stdin EOF, so cleanup then waits for TCP keepalive or the run deadline.
+- Remote hosts other than the two above, Linux remote hosts, and omp versions other than 18.12.6 / 18.13.0.
+- Use through `omp plugin link` / `omp plugin install` in a live interactive session; the extension load was checked only through RPC `get_state` with `--extension`.
+- Retention: run directories under the MacBook fallback (`~/.cache/agent-work/omp-remote-subtask/runs`) are not managed by `agent_work.py gc`.
 
 ## License
 
