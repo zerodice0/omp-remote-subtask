@@ -1,0 +1,10 @@
+{
+  "name": "omp-remote-subtask",
+  "version": "0.1.0",
+  "description": "Read-only remote omp subtasks over supervised SSH RPC",
+  "type": "module",
+  "private": false,
+  "license": "MIT",
+  "omp": { "extensions": ["./src/extension.ts"] },
+  "scripts": { "test": "BUN_BE_BUN=1 omp test" }
+}
