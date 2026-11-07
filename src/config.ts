@@ -6,11 +6,17 @@ import { validateSshAlias } from "./ssh.ts";
 export const REMOTE_ROLES = ["tiny", "smol", "explore", "slow"] as const;
 export type RemoteRole = typeof REMOTE_ROLES[number];
 
+export interface RunPolicy {
+  requireMode?: { path: string; value: string };
+  systemdSlice?: { slice: string; memoryMax?: string; memorySwapMax?: string };
+}
+
 export interface HostConfig {
   sshAlias: string;
   defaultRole?: RemoteRole;
   allowedCwdRoots?: string[];
   allowExec?: boolean;
+  runPolicy?: RunPolicy;
 }
 
 export interface HostsConfig {
@@ -68,7 +74,7 @@ export function loadConfig(configPath = process.env.OMP_REMOTE_SUBTASK_CONFIG ??
   for (const [name, rawHost] of Object.entries(object(root.hosts, "hosts"))) {
     if (!name || /[\0\r\n]/.test(name)) invalid("host names must be nonempty single-line strings");
     const host = object(rawHost, `hosts.${name}`);
-    keys(host, ["sshAlias", "defaultRole", "allowedCwdRoots", "allowExec"], `hosts.${name}`);
+    keys(host, ["sshAlias", "defaultRole", "allowedCwdRoots", "allowExec", "runPolicy"], `hosts.${name}`);
     if (typeof host.sshAlias !== "string") invalid(`hosts.${name}.sshAlias must be a string`);
     validateSshAlias(host.sshAlias);
     const parsed: HostConfig = { sshAlias: host.sshAlias, allowExec: false };
@@ -86,6 +92,35 @@ export function loadConfig(configPath = process.env.OMP_REMOTE_SUBTASK_CONFIG ??
         if (typeof cwd !== "string" || !posix.isAbsolute(cwd) || /[\0\r\n]/.test(cwd)) invalid(`hosts.${name}.allowedCwdRoots[${index}] must be an absolute single-line path`);
         return posix.normalize(cwd);
       });
+    }
+    if (host.runPolicy !== undefined) {
+      const location = `hosts.${name}.runPolicy`;
+      const policy = object(host.runPolicy, location);
+      keys(policy, ["requireMode", "systemdSlice"], location);
+      const runPolicy: RunPolicy = {};
+      if (policy.requireMode !== undefined) {
+        const modeLocation = `${location}.requireMode`;
+        const mode = object(policy.requireMode, modeLocation);
+        keys(mode, ["path", "value"], modeLocation);
+        if (typeof mode.path !== "string" || !posix.isAbsolute(mode.path) || /[\0\r\n]/.test(mode.path)) invalid(`${modeLocation}.path must be an absolute single-line path`);
+        if (typeof mode.value !== "string" || !mode.value || /[\0\r\n]/.test(mode.value)) invalid(`${modeLocation}.value must be a nonempty single-line string`);
+        runPolicy.requireMode = { path: mode.path, value: mode.value };
+      }
+      if (policy.systemdSlice !== undefined) {
+        const sliceLocation = `${location}.systemdSlice`;
+        const slice = object(policy.systemdSlice, sliceLocation);
+        keys(slice, ["slice", "memoryMax", "memorySwapMax"], sliceLocation);
+        if (typeof slice.slice !== "string" || !/^[A-Za-z0-9:_.-]+\.slice(?![\s\S])/.test(slice.slice)) invalid(`${sliceLocation}.slice must be a valid systemd slice name`);
+        const systemdSlice: NonNullable<RunPolicy["systemdSlice"]> = { slice: slice.slice };
+        for (const key of ["memoryMax", "memorySwapMax"] as const) {
+          const value = slice[key];
+          if (value === undefined) continue;
+          if (typeof value !== "string" || !/^(?:\d+(?:\.\d+)?[KMGT]?|infinity)(?![\s\S])/.test(value)) invalid(`${sliceLocation}.${key} must be a size string or infinity`);
+          systemdSlice[key] = value;
+        }
+        runPolicy.systemdSlice = systemdSlice;
+      }
+      parsed.runPolicy = runPolicy;
     }
     hosts[name] = parsed;
   }

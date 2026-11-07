@@ -1,12 +1,12 @@
 import { afterAll, expect, test } from 'bun:test';
 import { spawn, execFileSync } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { EXEC_OVERLAY_YAML, EXEC_TOOLS, OVERLAY_YAML, READ_ONLY_NOTE, execNote, execOverlay, runRemoteTask, type RemoteMode, type RunnerOptions, type SupervisorConfig, type TransportRequest } from '../src/runner.ts';
 import { posixQuote } from '../src/ssh.ts';
-import type { RemoteRole } from '../src/config.ts';
+import type { RemoteRole, RunPolicy } from '../src/config.ts';
 
 const scratchRoot = execFileSync(join(homedir(), '.config/herdr/scripts/agent_work.py'), ['path', '--name', 'runner-tests'], { encoding: 'utf8' }).trim();
 const scratch = execFileSync('mktemp', ['-d', '-p', scratchRoot], { encoding: 'utf8' }).trim();
@@ -19,6 +19,11 @@ const config = { roleTimeoutSeconds: { tiny: 10, smol: 15, explore: 20, slow: 30
 const children: number[] = [];
 const flags = '--mode --no-ui --cwd --session-dir --no-title --tools --no-extensions --no-skills --no-rules --no-prewalk --no-lsp --no-pty --config --append-system-prompt --model --max-time';
 const mcpDiscoveryProviders = ['native', 'omp-plugins', 'claude', 'agent-plugins', 'claude-plugins', 'codex', 'gemini', 'opencode', 'cursor', 'windsurf', 'vscode', 'mcp-json'];
+function probeOutput(request: TransportRequest, extra = '') {
+  const runId = request.script.match(/rst-\d{14}-[a-f0-9]{6}/)?.[0];
+  if (!runId) throw new Error('run ID missing from probe');
+  return `omp_path=${executable}\nomp_version=fake-1\nbun_version=1.4\nhelp_b64=${Buffer.from(flags).toString('base64')}\ncwd_real=${scratch}\nrevision=\nbranch=\ndirty_count=\nrun_dir=${join(scratch, runId)}\nrun_dir_source=fallback\nhome=${scratch}\ndisabled_providers_json=["anthropic"]\n${extra}`;
+}
 function localTransport(mode: string) {
   return (request: TransportRequest) => {
     if (request.kind === 'launch') {
@@ -29,11 +34,7 @@ function localTransport(mode: string) {
       return child;
     }
     let output = '';
-    if (request.kind === 'probe') {
-      const runId = request.script.match(/rst-\d{14}-[a-f0-9]{6}/)?.[0];
-      if (!runId) throw new Error('run ID missing from probe');
-      output = `omp_path=${executable}\nomp_version=fake-1\nbun_version=1.4\nhelp_b64=${Buffer.from(flags).toString('base64')}\ncwd_real=${scratch}\nrevision=\nbranch=\ndirty_count=\nrun_dir=${join(scratch, runId)}\nrun_dir_source=fallback\nhome=${scratch}\ndisabled_providers_json=["anthropic"]\n`;
-    }
+    if (request.kind === 'probe') output = probeOutput(request);
     return spawn('/bin/sh', ['-c', `printf %s ${posixQuote(output)}`], { stdio: 'pipe' });
   };
 }
@@ -55,6 +56,7 @@ afterAll(() => { for (const pid of children) { try { process.kill(pid, 'SIGKILL'
 test('completed: negotiates, checks inheritance, prompts once and waits for settled', async () => {
   const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Answer locally.', role: 'tiny' }, options());
   expect(result.details.status).toBe('completed');
+  expect(result.details).not.toHaveProperty('runPolicy');
   expect(result.text).toContain('Local fake answer.');
   expect(result.details.protocolVersion).toBe(2);
   expect(result.details.actualModel).toBe('fake/model');
@@ -283,4 +285,199 @@ test.each(['write', 'task', 'eval', 'browser', 'ast_edit', 'computer', 'generate
   const sent = events(result.details.localLogDir).filter(event => event.direction === 'sent').map(event => event.value);
   expect(sent.some(frame => frame.type === 'get_state')).toBe(true);
   expect(sent.filter(frame => frame.type === 'prompt')).toHaveLength(0);
+});
+
+interface PolicyScenario {
+  probeObserved?: string;
+  rejectProbe?: boolean;
+  launchGateObserved?: string;
+  stop?: 'mode_changed' | 'supervisor_signal' | 'unit_result';
+  unitCode?: number;
+  waitForAbort?: boolean;
+  noStarted?: boolean;
+  groupGone?: boolean;
+  omitUnitResult?: boolean;
+}
+
+function policyOptions(scenario: PolicyScenario = {}) {
+  const directory = mkdtempSync(join(scratch, 'policy-'));
+  const modePath = join(directory, 'mode');
+  writeFileSync(modePath, 'server\n');
+  const policy: RunPolicy = {
+    requireMode: { path: modePath, value: 'server' },
+    systemdSlice: { slice: 'ally-jobs.slice', memoryMax: '4G', memorySwapMax: '2G' },
+  };
+  const opts = options();
+  opts.config = { ...config, hosts: { local: { sshAlias: 'local', allowExec: true, runPolicy: policy } } };
+  const requests: TransportRequest[] = [];
+  const transport = localTransport('complete');
+  opts.transport = request => {
+    requests.push(request);
+    if (request.kind === 'probe') {
+      const observed = Buffer.from(scenario.probeObserved ?? 'server').toString('base64');
+      const output = scenario.rejectProbe
+        ? `mode_observed_b64=${observed}\nmode_error=not_allowed\n`
+        : probeOutput(request, `mode_observed_b64=${observed}\n`);
+      return spawn('/bin/sh', ['-c', `printf %s ${posixQuote(output)}`], { stdio: 'pipe' });
+    }
+    if (request.kind !== 'launch' || (scenario.launchGateObserved === undefined && !scenario.stop)) return transport(request);
+    const script = `
+const { createInterface } = require('node:readline');
+const runId = ${JSON.stringify(request.supervisorConfig!.runId)};
+const scenario = ${JSON.stringify(scenario)};
+const send = value => process.stdout.write(JSON.stringify(value) + '\\n');
+const frame = value => send({ type: 'remote_subtask_supervisor', runId, ...value });
+if (scenario.launchGateObserved !== undefined) {
+  frame({ event: 'exited', reason: 'remote_mode_not_allowed', groupGone: true, modeObservedB64: Buffer.from(scenario.launchGateObserved).toString('base64') });
+  frame({ event: 'unit_result', code: 78 });
+  process.exitCode = 78;
+} else {
+  const input = createInterface({ input: process.stdin });
+  const response = (command, data) => send({ type: 'response', id: command.id, command: command.type, success: true, data });
+  const stop = () => {
+    if (scenario.stop === 'unit_result') frame({ event: 'unit_result', code: scenario.unitCode ?? 137 });
+    else {
+      frame({ event: 'exited', reason: scenario.stop, groupGone: scenario.groupGone ?? true, modeObserved: scenario.stop === 'mode_changed' ? 'game' : 'server' });
+      if (!scenario.omitUnitResult) frame({ event: 'unit_result', code: 143 });
+    }
+    input.close();
+    process.stdin.destroy();
+  };
+  if (!scenario.noStarted) frame({ event: 'started', modeObserved: 'server', pid: process.pid, pgid: process.pid });
+  send({ type: 'ready', protocolVersion: 2, supportedProtocolVersions: [1, 2], maxFrameBytes: 1048576, maxReassembledFrameBytes: 67108864 });
+  input.on('line', line => {
+    const command = JSON.parse(line);
+    if (command.type === 'negotiate_protocol') response(command, { protocolVersion: 2 });
+    else if (command.type === 'get_state') response(command, { dumpTools: ['read', 'grep', 'glob'].map(name => ({ name })), model: { provider: 'fake', id: 'policy' } });
+    else if (command.type === 'prompt') {
+      response(command, {});
+      if (scenario.waitForAbort) send({ type: 'fixture_policy_prompt' });
+      else stop();
+    } else if (command.type === 'abort') { response(command, {}); stop(); }
+  });
+}
+`;
+    const child = spawn(process.execPath, ['-e', script], { env: { ...process.env, BUN_BE_BUN: '1' }, stdio: 'pipe' });
+    if (child.pid) children.push(child.pid);
+    return child;
+  };
+  return { opts, requests, policy };
+}
+
+test.each(['game', 'unreadable', 'game\nsecond=line'])('policy probe rejection reports observed mode %s without launching', async observed => {
+  const { opts, requests, policy } = policyOptions({ probeObserved: observed, rejectProbe: true });
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Do not send.' }, opts);
+  expect(result.details.status).toBe('failed');
+  expect(result.details.notStarted).toBe(true);
+  expect(result.details.cancellationConfirmed).toBe(false);
+  expect(result.details.error?.code).toBe('remote_mode_not_allowed');
+  expect(result.details.error?.message).toContain(JSON.stringify(observed));
+  expect(result.details.runPolicy).toEqual({
+    ...policy, modeObserved: observed, unitName: `remote-subtask-${result.details.runId}.service`,
+  });
+  expect(result.details.remoteRunDir).toBeNull();
+  expect(requests.map(request => request.kind)).toEqual(['probe']);
+});
+
+test.each(['game', 'unreadable', 'game\nsecond=line'])('initial launch gate updates the observed mode to %s without prompting', async observed => {
+  const { opts, requests, policy } = policyOptions({ launchGateObserved: observed });
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Do not send.' }, opts);
+  expect(result.details.status).toBe('failed');
+  expect(result.details.notStarted).toBe(true);
+  expect(result.details.cancellationConfirmed).toBe(false);
+  expect(result.details.error?.code).toBe('remote_mode_not_allowed');
+  expect(result.details.error?.message).toContain(JSON.stringify(observed));
+  expect(result.details.runPolicy?.modeObserved).toBe(observed);
+  expect(requests.map(request => request.kind)).toEqual(['probe', 'launch']);
+  expect(requests[1].supervisorConfig?.requireMode).toEqual(policy.requireMode);
+  expect(events(result.details.localLogDir).filter(event => event.direction === 'sent')).toEqual([]);
+});
+
+test.each([
+  { stop: 'mode_changed', expected: 'mode_changed', observed: 'game', unitCode: undefined },
+  { stop: 'supervisor_signal', expected: 'remote_unit_stopped', observed: 'server', unitCode: undefined },
+  { stop: 'unit_result', expected: 'remote_unit_stopped', observed: 'server', unitCode: 0 },
+  { stop: 'unit_result', expected: 'remote_unit_stopped', observed: 'server', unitCode: 1 },
+  { stop: 'unit_result', expected: 'remote_unit_stopped', observed: 'server', unitCode: 137 },
+] as const)('uncancelled policy stop $stop ($unitCode) reports $expected instead of cancellation', async ({ stop, expected, observed, unitCode }) => {
+  const { opts, requests } = policyOptions({ stop, unitCode });
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Start then stop.' }, opts);
+  expect(result.details.status).toBe('failed');
+  expect(result.details.notStarted).toBeUndefined();
+  expect(result.details.cancellationConfirmed).toBe(false);
+  expect(result.details.error?.code).toBe(expected);
+  expect(result.details.runPolicy?.modeObserved).toBe(observed);
+  if (expected === 'remote_unit_stopped') expect(result.details.error?.message).toContain(result.details.runPolicy!.unitName!);
+  else expect(result.details.error?.message).toContain('"game"');
+  const sent = events(result.details.localLogDir).filter(event => event.direction === 'sent').map(event => event.value);
+  expect(sent.filter(frame => frame.type === 'prompt')).toHaveLength(1);
+  expect(sent.filter(frame => frame.type === 'abort')).toHaveLength(0);
+  expect(sent.filter(frame => frame.type === 'remote_subtask_control')).toHaveLength(0);
+  const cleanup = requests.filter(request => request.kind === 'cleanup');
+  if (stop === 'unit_result') {
+    expect(result.details.supervisor?.exited).toBeNull();
+    expect(cleanup).toHaveLength(1);
+    expect(cleanup[0].script).toContain(`systemctl --user stop --no-block ${result.details.runPolicy!.unitName}`);
+    expect(cleanup[0].script).not.toContain('ally-jobs.slice');
+    expect(result.details.postCheck).toEqual({ output: '' });
+  } else {
+    expect(result.details.supervisor?.exited?.reason).toBe(stop);
+    expect(cleanup).toEqual([]);
+  }
+});
+
+test.each([0, 127])('unit exit %s without supervisor startup retains a distinct launch or stop error', async unitCode => {
+  const { opts } = policyOptions({ stop: 'unit_result', unitCode, noStarted: true });
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Start then stop.' }, opts);
+  expect(result.details.status).toBe('failed');
+  expect(result.details.error?.code).toBe(unitCode === 0 ? 'remote_unit_stopped' : 'remote_unit_launch_failed');
+  expect(result.details.error?.message).toContain(`unit exit ${unitCode}`);
+  expect(result.details.error?.message).toContain(`${result.details.localLogDir}/ssh-stderr.log`);
+});
+
+test('mode change without confirmed cleanup preserves unknown and warns against resending', async () => {
+  const { opts } = policyOptions({ stop: 'mode_changed', groupGone: false, omitUnitResult: true });
+  delete opts.config!.hosts.local.runPolicy!.systemdSlice;
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Start then stop.' }, opts);
+  expect(result.details.status).toBe('unknown');
+  expect(result.details.error?.code).toBe('mode_changed');
+  expect(result.details.error?.message).toContain('Do not automatically resend');
+});
+
+test.each(['mode_changed', 'supervisor_signal'] as const)('caller cancellation retains aborted semantics when the supervisor reports %s', async stop => {
+  const { opts } = policyOptions({ stop, waitForAbort: true });
+  const controller = new AbortController();
+  opts.signal = controller.signal;
+  opts.onTransportSpawn = child => {
+    let output = '';
+    child.stdout?.on('data', chunk => {
+      output += chunk.toString();
+      if (output.includes('"type":"fixture_policy_prompt"')) controller.abort();
+    });
+  };
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Wait for cancellation.' }, opts);
+  expect(result.details.status).toBe('aborted');
+  expect(result.details.cancellationConfirmed).toBe(true);
+  expect(result.details.error?.code).toBe('cancellation_confirmed');
+  expect(result.details.supervisor?.exited?.reason).toBe(stop);
+  const sent = events(result.details.localLogDir).filter(event => event.direction === 'sent').map(event => event.value);
+  expect(sent.filter(frame => frame.type === 'prompt')).toHaveLength(1);
+  expect(sent.filter(frame => frame.type === 'abort')).toHaveLength(1);
+});
+
+test.each(['read', 'exec'] as const)('successful %s run returns policy metadata and passes the gate to its supervisor', async mode => {
+  const { opts, requests, policy } = policyOptions();
+  const result = await runRemoteTask({ host: 'local', cwd: scratch, task: 'Answer locally.', mode }, opts);
+  expect(result.details.status).toBe('completed');
+  expect(result.details.cancellationConfirmed).toBe(false);
+  expect(result.details.error).toBeUndefined();
+  expect(result.details.runPolicy).toEqual({
+    ...policy, modeObserved: 'server', unitName: `remote-subtask-${result.details.runId}.service`,
+  });
+  expect(result.details.supervisor?.started?.modeObserved).toBe('server');
+  expect(result.details.supervisor?.exited?.groupGone).toBe(true);
+  const launch = requests.find(request => request.kind === 'launch')!;
+  expect(launch.supervisorConfig?.requireMode).toEqual(policy.requireMode);
+  expect(launch.supervisorConfig?.mode).toBe(mode);
+  expect(requests.map(request => request.kind)).toEqual(['probe', 'launch']);
 });

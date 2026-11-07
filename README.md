@@ -46,6 +46,53 @@ The tool registers even if configuration is missing or invalid, then returns a c
 
 `roleTimeoutSeconds` is optional; its only allowed keys are the four roles, and omitted entries retain the built-in defaults shown above. Each timeout must be a positive number no greater than `maxTimeoutSeconds` (default 3600 seconds), including entries inherited from the built-in defaults. Resolve the role first (explicit tool-call role, host `defaultRole`, then `explore`); an explicit tool-call `timeoutSeconds` overrides that role's configured timeout. Omit `timeoutSeconds` unless the task needs a different bound.
 
+### Optional host run policy
+
+`runPolicy` is optional and applies to both `read` and `exec` calls. Hosts without it keep their existing launch, environment, and cleanup behavior. An empty policy changes nothing. The policy does not enable exec or override `allowExec`.
+
+This example permits ROG Ally X runs only in server mode and places each run in the existing user slice with 8G of memory and 2G of swap:
+
+```json
+{
+  "hosts": {
+    "rogallyx": {
+      "sshAlias": "rogallyx",
+      "allowedCwdRoots": ["/home/zerodice0/workspace"],
+      "allowExec": false,
+      "runPolicy": {
+        "requireMode": {
+          "path": "/var/lib/ally-mode/mode",
+          "value": "server"
+        },
+        "systemdSlice": {
+          "slice": "ally-jobs.slice",
+          "memoryMax": "8G",
+          "memorySwapMax": "2G"
+        }
+      }
+    }
+  }
+}
+```
+
+Both policy sections are optional and can be used separately. Unknown keys at any level fail with `invalid_config`.
+
+- `requireMode` requires `path` and `value`. The path must be absolute. The value must be nonempty. Neither string can contain NUL, CR, or LF. Spaces are significant.
+- `systemdSlice` requires `slice`. Its name must match `^[A-Za-z0-9:_.\-]+\.slice$` with no trailing characters or line terminators.
+- Optional `memoryMax` and `memorySwapMax` map to systemd's `MemoryMax` and `MemorySwapMax` properties on each run's service. Each is a string matching `^(?:\d+(\.\d+)?[KMGT]?|infinity)$` with no trailing characters or line terminators. Examples include `"1024"`, `"1.5G"`, and `"infinity"`. Omitted limits use the systemd defaults and inherited slice limits.
+
+The runner checks the remote mode file during the probe and immediately before launch. A slice-backed run checks again inside its unit before starting the supervisor. The supervisor checks before starting omp and polls every two seconds while the run is active. Each check removes trailing LF characters from the file, but preserves spaces and CR. A missing, unreadable, or unequal file fails closed. The plugin never writes the mode file.
+
+A mode change can race with launch. Repeated checks reduce that window but do not make the mode file and process launch atomic. A change after the last check can allow work until the next poll. On Ally X, `ally-mode game` also stops jobs in `ally-jobs.slice`. A stopped run is not resumed or retried.
+
+With `systemdSlice`, the remote host must support `systemd-run --user --expand-environment=no`, `systemctl --user`, and a working user service manager. Each run starts a separate `remote-subtask-<runId>.service` through `systemd-run --user --pipe --wait --collect`. Environment expansion of command arguments is disabled so literal paths and mode values retain `$` characters. The runner selects the configured slice and applies only the configured memory properties. Unsupported commands or rejected unit properties fail the run rather than fall back to an unrestricted launch. Limits apply to the service and its descendants, subject to systemd and kernel support. They do not add filesystem or network isolation.
+
+The unit retains the SSH login environment, including authentication variables, rather than using the user manager's potentially stale environment. The launcher explicitly passes `HOME`, `PATH`, and `BUN_BE_BUN`, and imports a private snapshot of exported variables inside the unit. The snapshot is removed after import. The supervisor still sets `TMPDIR` to `<remoteRunDir>/tmp` and removes `BUN_BE_BUN` from the omp child's environment. The policy does not change the remote user's permissions, tool profile, model settings, or device-claim requirements.
+
+`details.runPolicy` records the configured policy, the last `modeObserved`, and the derived `unitName` for slice-backed runs. A unit name identifies the planned service even if the mode gate rejects launch before the service exists. Supervisor frames also include the observed mode when a mode policy is present.
+
+On cancellation, timeout, EOF, or a mode change, the supervisor uses its existing abort, TERM, KILL, and owned-descendant cleanup sequence. The slice launcher's exit trap stops only that run's service. The plugin does not stop the whole slice, change host modes, or kill unrelated sessions. Run evidence remains in agent-work.
+
 ## Tool contract
 
 ```json
@@ -142,9 +189,18 @@ The earlier **141,730-token** investigation found that `--no-tools` removed buil
 - **aborted**: cancellation was requested **and** the supervisor's exit frame confirmed `groupGone: true`.
 - **unknown**: the transport disappeared after the prompt was sent, or cancellation/process cleanup could not be confirmed. Inspect recorded run/session paths before deciding whether to start new work.
 
-**A lost prompt is never resent automatically.** SSH reconnection is only used for a bounded post-cancellation process check, not recovery or retry. A clean post-check alone does not upgrade unknown to confirmed cancellation.
+**A lost prompt is never resent automatically.** SSH reconnection is used only for a bounded post-cancellation process check, or to stop a policy-backed run's own unit after transport loss. It does not recover or retry the task. A clean post-check alone does not upgrade unknown to confirmed cancellation.
 
 The supervisor spawns omp in its own process group and removes `BUN_BE_BUN` from that child's environment. Caller cancellation sends RPC `abort`, waits a grace period, then requests supervisor termination. The supervisor handles control termination, stdin EOF (including SSH drop), and its own deadline. It aborts/closes child input and escalates TERM to KILL for **only its owned processes**, including tracked descendants that escape the original process group, before reporting exit. Normal settlement also cleans up owned background descendants; a final answer is not permission to leave a service running. Cleanup does not target unrelated sessions or processes. Disconnects can prevent its confirmation reaching the caller even when cleanup succeeded. Default grace is ten seconds per stage; local timeout includes a small margin over the requested remote limit. This process tracking is not a sandbox or a guarantee against hostile daemonization. An OS crash, uninterruptible process, or broken network can prevent confirmation.
+
+Run-policy failures add these error reasons:
+
+- `remote_mode_not_allowed` means a mode check rejected the run before omp started.
+- `mode_changed` means the supervisor observed a disallowed or unreadable mode during the run and began owned-process cleanup.
+- `remote_unit_stopped` means a configured systemd unit ended without a supervisor exit frame, or its supervisor received a termination signal without caller cancellation. This can happen when `ally-mode game` stops the slice or when a resource limit ends the unit. The reason alone does not identify which event occurred.
+- `remote_unit_launch_failed` means `systemd-run` returned a nonzero code before the supervisor reported startup. Missing systemd tools, an unavailable user manager, or rejected properties can cause this. The message includes the unit exit code and the local SSH stderr log path.
+
+A supervisor signal maps to `remote_unit_stopped` only for a slice-backed run without caller cancellation. Caller cancellation retains the existing cancellation and cleanup-confirmation rules. If the transport or supervisor disappears before cleanup is confirmed, the result can remain `unknown`.
 
 ## Logs and limits
 
@@ -156,7 +212,7 @@ The supervisor creates `<remoteRunDir>/tmp` and exports it as `TMPDIR` for **bot
 
 Named helper directories are `remote-subtask-<runId>` and normally become eligible for `agent_work.py gc` after **14 days since their last `path --name` use**, when not in use; each helper `path` call refreshes that lifetime. Retain needed evidence before expiry or pin the named directory with the helper. The plugin does not delete run evidence. Home-cache fallback directories are not managed by that named-directory GC and need explicit retention management.
 
-Logs and sessions can contain the full task, source text, inherited system prompt, and model output. Keep them private and apply your normal agent-work retention policy. Both profiles are instruction/tool policies, not filesystem sandboxes. Host heavy-work/device rules still apply; exec guidance does not replace a host's slot or device-claim requirements. There are no additional dependencies or runtimes to install.
+Logs and sessions can contain the full task, source text, inherited system prompt, and model output. Keep them private and apply your normal agent-work retention policy. Both profiles are instruction/tool policies, not filesystem sandboxes. Host heavy-work/device rules still apply; exec guidance does not replace a host's slot or device-claim requirements. Hosts without `systemdSlice` need no additional dependencies or runtimes. Opting into `systemdSlice` requires the systemd user-service support described above.
 
 ## Development and manual smoke
 

@@ -1,3 +1,4 @@
+import type { RunPolicy } from "./config.ts";
 import { posixQuote } from "./ssh.ts";
 
 export interface ProbeResult {
@@ -14,13 +15,14 @@ export interface ProbeResult {
   runDirSource: "agent_work" | "fallback";
   home: string;
   disabledProviders: unknown[];
+  modeObserved?: string;
 }
 
 function checkRunId(runId: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}(?![\s\S])/.test(runId) || runId === "." || runId === "..") throw new Error("invalid_run_id");
 }
 
-export function buildProbeScript({ cwd, runId, exec = false }: { cwd: string; runId: string; exec?: boolean }): string {
+export function buildProbeScript({ cwd, runId, exec = false, runPolicy }: { cwd: string; runId: string; exec?: boolean; runPolicy?: RunPolicy }): string {
   checkRunId(runId);
   return `set -eu
 emit() {
@@ -30,6 +32,14 @@ emit() {
     *) printf '%s=%s\\n' "$1" "$2" ;;
   esac
 }
+${runPolicy?.requireMode ? `mode_readable=1
+mode_observed=$(cat -- ${posixQuote(runPolicy.requireMode.path)} 2>/dev/null) || { mode_observed=unreadable; mode_readable=0; }
+printf 'mode_observed_b64='; printf %s "$mode_observed" | base64 | tr -d '\\r\\n'; printf '\\n'
+if [ "$mode_readable" != 1 ] || [ "$mode_observed" != ${posixQuote(runPolicy.requireMode.value)} ]; then
+  printf 'mode_error=not_allowed\\n'
+  exit 0
+fi
+` : ""}\
 omp_path=$(command -v omp) || { printf 'omp_error=missing\\n'; exit 127; }
 emit omp_path "$omp_path"
 omp_version=$(unset BUN_BE_BUN; "$omp_path" --version)
@@ -92,6 +102,7 @@ export function parseProbe(stdout: string): ProbeResult {
     if (Object.hasOwn(values, key)) throw new Error(`invalid_probe: duplicate ${key}`);
     values[key] = encoded ? decodeBase64(line.slice(separator + 1), key) : line.slice(separator + 1);
   }
+  if (values.mode_error) throw new RemoteModeError(values.mode_observed ?? "unreadable");
   if (values.omp_error) throw new Error(`unsupported_remote_omp: ${values.omp_error}`);
   for (const key of ["omp_path", "omp_version", "bun_version", "help", "home"]) {
     if (!values[key]) throw new Error(`invalid_probe: missing ${key}`);
@@ -119,6 +130,7 @@ export function parseProbe(stdout: string): ProbeResult {
     dirtyCount: count === "" ? null : Number(count), runDir: values.run_dir ?? "",
     runDirSource: values.run_dir_source === "agent_work" ? "agent_work" : "fallback",
     disabledProviders,
+    ...(values.mode_observed !== undefined ? { modeObserved: values.mode_observed } : {}),
   };
 }
 
@@ -126,26 +138,76 @@ export function supportedFlags(help: string): Set<string> {
   return new Set(help.match(/--[a-zA-Z][a-zA-Z0-9-]*/g) ?? []);
 }
 
-export function buildLaunchScript({ ompPath, runDir, supervisorSource, supervisorConfig }: {
-  ompPath: string; runDir: string; supervisorSource: string; supervisorConfig: unknown;
+export class RemoteModeError extends Error {
+  constructor(public readonly observed: string) {
+    super(`remote_mode_not_allowed: observed ${JSON.stringify(observed)}`);
+  }
+}
+
+export function systemdUnitName(runId: string): string {
+  checkRunId(runId);
+  return `remote-subtask-${runId}.service`;
+}
+
+function launchModeGate(requireMode: NonNullable<RunPolicy["requireMode"]>, runId: string): string {
+  const prefix = JSON.stringify({ type: "remote_subtask_supervisor", runId, event: "exited", reason: "remote_mode_not_allowed", groupGone: true }).slice(0, -1);
+  return `mode_readable=1
+mode_observed=$(cat -- ${posixQuote(requireMode.path)} 2>/dev/null) || { mode_observed=unreadable; mode_readable=0; }
+if [ "$mode_readable" != 1 ] || [ "$mode_observed" != ${posixQuote(requireMode.value)} ]; then
+  printf %s ${posixQuote(prefix + ',"modeObservedB64":"')}
+  printf %s "$mode_observed" | base64 | tr -d '\\r\\n'
+  printf '"}\\n'
+  exit 78
+fi
+`;
+}
+
+export function buildLaunchScript({ ompPath, runDir, supervisorSource, supervisorConfig, runPolicy, runId }: {
+  ompPath: string; runDir: string; supervisorSource: string; supervisorConfig: unknown; runPolicy?: RunPolicy; runId?: string;
 }): string {
   const source = Buffer.from(supervisorSource, "utf8").toString("base64");
   const config = JSON.stringify(supervisorConfig);
   if (config === undefined) throw new Error("invalid_supervisor_config");
+  const supervisor = `exec env BUN_BE_BUN=1 ${posixQuote(ompPath)} ${posixQuote(`${runDir}/supervisor.mjs`)} ${posixQuote(Buffer.from(config, "utf8").toString("base64"))}`;
+  let launch = supervisor;
+  if (runPolicy) {
+    if (!runId) throw new Error("invalid_run_id");
+    checkRunId(runId);
+    const gate = runPolicy.requireMode ? launchModeGate(runPolicy.requireMode, runId) : "";
+    launch = gate + supervisor;
+    if (runPolicy.systemdSlice) {
+      const { slice, memoryMax, memorySwapMax } = runPolicy.systemdSlice;
+      const unit = systemdUnitName(runId);
+      const properties = [memoryMax !== undefined ? ` -p ${posixQuote(`MemoryMax=${memoryMax}`)}` : "", memorySwapMax !== undefined ? ` -p ${posixQuote(`MemorySwapMax=${memorySwapMax}`)}` : ""].join("");
+      const resultPrefix = JSON.stringify({ type: "remote_subtask_supervisor", runId, event: "unit_result" }).slice(0, -1);
+      const environmentPath = posixQuote(`${runDir}/launch-env.sh`);
+      launch = `${gate}export -p > ${environmentPath}
+cleanup_unit() { systemctl --user stop ${posixQuote(unit)} >/dev/null 2>&1 || :; rm -f ${environmentPath}; }
+trap cleanup_unit EXIT
+trap 'exit 143' HUP INT TERM
+set +e
+systemd-run --user --pipe --wait --collect --quiet --expand-environment=no --slice=${posixQuote(slice)} --unit=${posixQuote(unit)}${properties} -E HOME="$HOME" -E PATH="$PATH" -E BUN_BE_BUN=1 -- /bin/sh -c ${posixQuote(gate + `. ${environmentPath}\nrm -f ${environmentPath}\n` + supervisor)}
+unit_code=$?
+printf '%s,"code":%s}\\n' ${posixQuote(resultPrefix)} "$unit_code"
+exit "$unit_code"`;
+    }
+  }
   return `set -eu
 umask 077
 mkdir -p ${posixQuote(runDir)} ${posixQuote(`${runDir}/sessions`)}
 decoder=/usr/bin/base64
 [ -x "$decoder" ] || decoder=$(command -v base64) || exit 127
 printf %s ${posixQuote(source)} | "$decoder" -d > ${posixQuote(`${runDir}/supervisor.mjs`)} 2>/dev/null || printf %s ${posixQuote(source)} | "$decoder" -D > ${posixQuote(`${runDir}/supervisor.mjs`)} || exit
-exec env BUN_BE_BUN=1 ${posixQuote(ompPath)} ${posixQuote(`${runDir}/supervisor.mjs`)} ${posixQuote(Buffer.from(config, "utf8").toString("base64"))}
+${launch}
 `;
 }
 
-export function buildCleanupCheckScript({ runId }: { runId: string }): string {
+export function buildCleanupCheckScript({ runId, stopUnit }: { runId: string; stopUnit?: string }): string {
   checkRunId(runId);
+  if (stopUnit !== undefined && stopUnit !== systemdUnitName(runId)) throw new Error("invalid_run_unit");
   return `set -eu
 run_id=${posixQuote(runId)}
+${stopUnit ? `systemctl --user stop --no-block ${posixQuote(stopUnit)} >/dev/null 2>&1 || :\n` : ""}\
 processes=$(ps -axo pid=,pgid=,command=)
 while read -r pid pgid command; do
   [ "$pid" = "$$" ] && continue

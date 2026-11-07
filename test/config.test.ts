@@ -103,3 +103,85 @@ test("host lookup safely supports own keys named like object prototypes", () => 
   const cfg = loadConfig(configPath);
   expect(resolveHost(cfg, "__proto__").sshAlias).toBe("safe");
 });
+
+test("run policy is opt-in and independent of exec permission", () => {
+  const requireMode = { path: "/var/lib/ally-mode/mode", value: "server" };
+  const systemdSlice = { slice: "ally-jobs.slice", memoryMax: "8G", memorySwapMax: "2G" };
+  const cfg = config({ hosts: {
+    plain: { sshAlias: "safe" },
+    empty: { sshAlias: "safe", runPolicy: {} },
+    modeOnly: { sshAlias: "safe", runPolicy: { requireMode } },
+    sliceOnly: { sshAlias: "safe", runPolicy: { systemdSlice: { slice: "ally-jobs.slice" } } },
+    combined: { sshAlias: "rogallyx", allowExec: true, runPolicy: { requireMode, systemdSlice } },
+  } });
+  expect(resolveHost(cfg, "plain")).toEqual({ sshAlias: "safe", allowExec: false });
+  expect(Object.hasOwn(resolveHost(cfg, "plain"), "runPolicy")).toBe(false);
+  expect(resolveHost(cfg, "empty").runPolicy).toEqual({});
+  expect(resolveHost(cfg, "modeOnly")).toEqual({ sshAlias: "safe", allowExec: false, runPolicy: { requireMode } });
+  expect(resolveHost(cfg, "sliceOnly").runPolicy).toEqual({ systemdSlice: { slice: "ally-jobs.slice" } });
+  expect(resolveHost(cfg, "combined")).toEqual({ sshAlias: "rogallyx", allowExec: true, runPolicy: { requireMode, systemdSlice } });
+});
+
+test("rejects non-object run policies and nested policy sections", () => {
+  for (const value of [null, false, 0, "", "server", []]) {
+    expect(() => config({ hosts: { ally: { sshAlias: "safe", runPolicy: value } } })).toThrow("invalid_config: hosts.ally.runPolicy must be an object");
+    for (const key of ["requireMode", "systemdSlice"]) {
+      expect(() => config({ hosts: { ally: { sshAlias: "safe", runPolicy: { [key]: value } } } })).toThrow(`invalid_config: hosts.ally.runPolicy.${key} must be an object`);
+    }
+  }
+});
+
+test("rejects unknown run policy keys at every nesting level", () => {
+  const policies = [
+    { extra: true },
+    { requireMode: { path: "/mode", value: "server", extra: true } },
+    { systemdSlice: { slice: "ally-jobs.slice", extra: true } },
+    { systemdSlice: { slice: "ally-jobs.slice", MemoryMax: "8G" } },
+  ];
+  for (const runPolicy of policies) {
+    expect(() => config({ hosts: { ally: { sshAlias: "safe", runPolicy } } })).toThrow("invalid_config:");
+    expect(() => config({ hosts: { ally: { sshAlias: "safe", runPolicy } } })).toThrow("unknown key");
+  }
+  expect(() => config({ hosts: {}, runPolicy: {} })).toThrow('invalid_config: config: unknown key "runPolicy"');
+});
+
+test("requires an absolute single-line mode path and a nonempty single-line value", () => {
+  for (const path of [undefined, null, false, 3, [], {}, "", "relative", "~/mode", "C:\\mode", "/bad\0path", "/bad\rpath", "/bad\npath", "/mode\n"]) {
+    expect(() => config({ hosts: { ally: { sshAlias: "safe", runPolicy: { requireMode: { path, value: "server" } } } } })).toThrow("invalid_config: hosts.ally.runPolicy.requireMode.path");
+  }
+  for (const value of [undefined, null, false, 3, [], {}, "", "ser\0ver", "ser\rver", "ser\nver", "server\n", "server\r\n"]) {
+    expect(() => config({ hosts: { ally: { sshAlias: "safe", runPolicy: { requireMode: { path: "/mode", value } } } } })).toThrow("invalid_config: hosts.ally.runPolicy.requireMode.value");
+  }
+  expect(() => config({ hosts: { ally: { sshAlias: "safe", runPolicy: { requireMode: {} } } } })).toThrow("invalid_config:");
+  const requireMode = { path: "/var/lib/ally mode/'current'", value: " server " };
+  expect(config({ hosts: { ally: { sshAlias: "safe", runPolicy: { requireMode } } } }).hosts.ally.runPolicy).toEqual({ requireMode });
+});
+
+test("accepts systemd slice names from the configured character set", () => {
+  for (const slice of ["ally-jobs.slice", "A0:_.-jobs.slice", "a.slice"]) {
+    expect(config({ hosts: { ally: { sshAlias: "safe", runPolicy: { systemdSlice: { slice } } } } }).hosts.ally.runPolicy).toEqual({ systemdSlice: { slice } });
+  }
+});
+
+test("rejects invalid systemd slice names and trailing line terminators", () => {
+  for (const slice of [undefined, null, false, 1, [], {}, "", ".slice", "ally-jobs", "ally-jobs.service", "/ally.slice", "ally jobs.slice", "ally@jobs.slice", "ally.slice;id", "ally.slice\0", "ally.slice\r", "ally.slice\n", "ally.slice\r\n", "ally.slice\u2028", "ally.slice\u2029", "ally\njobs.slice"]) {
+    expect(() => config({ hosts: { ally: { sshAlias: "safe", runPolicy: { systemdSlice: { slice } } } } })).toThrow("invalid_config: hosts.ally.runPolicy.systemdSlice.slice");
+  }
+});
+
+test("accepts each supported size format for both optional memory limits", () => {
+  for (const value of ["0", "0008", "1024", "1.5", "1K", "2M", "8G", "1T", "0.25G", "infinity"]) {
+    for (const key of ["memoryMax", "memorySwapMax"]) {
+      const systemdSlice = { slice: "ally-jobs.slice", [key]: value };
+      expect(config({ hosts: { ally: { sshAlias: "safe", runPolicy: { systemdSlice } } } }).hosts.ally.runPolicy).toEqual({ systemdSlice });
+    }
+  }
+});
+
+test("rejects invalid sizes and non-string limits with strict end matching", () => {
+  for (const value of [null, false, 0, 8, [], {}, "", "-1", "+1", ".5G", "1.G", "1.2.3G", "8g", "8GB", "1P", "1e3", "Infinity", "max", " 8G", "8G ", "8G;id", "8G\0", "8G\r", "8G\n", "8G\r\n", "8G\u2028", "8G\u2029", "infinity\n"]) {
+    for (const key of ["memoryMax", "memorySwapMax"]) {
+      expect(() => config({ hosts: { ally: { sshAlias: "safe", runPolicy: { systemdSlice: { slice: "ally-jobs.slice", [key]: value } } } } })).toThrow(`invalid_config: hosts.ally.runPolicy.systemdSlice.${key}`);
+    }
+  }
+});

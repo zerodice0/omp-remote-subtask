@@ -4,9 +4,9 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { loadConfig, resolveHost, REMOTE_ROLES, type HostsConfig, type RemoteRole } from './config.ts';
+import { loadConfig, resolveHost, REMOTE_ROLES, type HostsConfig, type RemoteRole, type RunPolicy } from './config.ts';
 import { controlPath, remoteShellCommand, sshArgv } from './ssh.ts';
-import { buildProbeScript, parseProbe, supportedFlags, buildLaunchScript, buildCleanupCheckScript } from './remote-scripts.ts';
+import { buildProbeScript, parseProbe, supportedFlags, buildLaunchScript, buildCleanupCheckScript, systemdUnitName, RemoteModeError } from './remote-scripts.ts';
 import { LineSplitter, RpcFrameDecoder, negotiate } from './rpc-frames.ts';
 import { checkInheritedTools, createRunState, reduceRunState, decide, type RunEvent, type RunState, type RunStatus } from './run-state.ts';
 import { createProgress, reduceProgress, progressSnapshot, progressText, type RemotePhase, type RemoteProgress, type RemoteToolCall } from './render.ts';
@@ -20,6 +20,7 @@ export interface TransportRequest {
 export interface SupervisorConfig {
   runId: string; ompPath: string; ompArgs: string[]; cwd: string; runDir: string; mode?: RemoteMode;
   deadlineSeconds: number; graceSeconds: number; overlayYaml: string;
+  requireMode?: RunPolicy['requireMode'];
 }
 export interface RunnerOptions {
   signal?: AbortSignal; onUpdate?: (text: string, details: { progress: RemoteProgress }) => void; cwd?: string; config?: HostsConfig;
@@ -38,6 +39,7 @@ export interface RemoteTaskDetails {
   supervisor?: RunState['supervisor']; stats?: unknown; postCheck?: { output?: string; error?: string };
   error?: { code: string; message: string };
   notStarted?: true;
+  runPolicy?: RunPolicy & { modeObserved?: string; unitName?: string };
 }
 export const READ_ONLY_NOTE = 'You are running as a remote read-only subtask launched by another omp session through remote_task. Do not modify files. Investigate with read/grep/glob and finish with a final answer that fully states the result.';
 export const OVERLAY_YAML = 'autolearn:\n  enabled: false\nmemory:\n  backend: off\nasync:\n  enabled: false\ntools:\n  approval:\n    write: deny\n    edit: deny\n    bash: deny\n    eval: deny\n    ast_edit: deny\n    task: deny\n    browser: deny\n';
@@ -124,6 +126,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   let child: ChildProcess | undefined;
   let cleanupCheck: (() => ChildProcess) | undefined;
   let transportClosed = false;
+  let unitExitCode: number | undefined;
   let promptSent = false;
   let completionDecided = false;
   let phase: RemotePhase = 'probe';
@@ -156,6 +159,12 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
       state = reduceRunState(state, { kind: 'abort_requested', reason: 'timeout' });
     }
     state = reduceRunState(state, event);
+    if (event.kind === 'frame' && event.frame.type === 'remote_subtask_supervisor') {
+      if (event.frame.event === 'unit_result' && typeof event.frame.code === 'number') unitExitCode = event.frame.code;
+      const observed = typeof event.frame.modeObserved === 'string' ? event.frame.modeObserved
+        : typeof event.frame.modeObservedB64 === 'string' ? Buffer.from(event.frame.modeObservedB64, 'base64').toString('utf8') : undefined;
+      if (details.runPolicy && observed !== undefined) details.runPolicy.modeObserved = observed;
+    }
     if (event.kind === 'frame') progress = reduceProgress(progress, event.frame, Date.now());
   };
   const send = (frame: object) => {
@@ -171,6 +180,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   try {
     const config = options.config ?? loadConfig();
     const host = resolveHost(config, params.host);
+    if (host.runPolicy) details.runPolicy = { ...host.runPolicy, ...(host.runPolicy.systemdSlice ? { unitName: systemdUnitName(runId) } : {}) };
     if (params.mode !== undefined && params.mode !== 'read' && params.mode !== 'exec') throw new Error('invalid_mode: expected read or exec');
     if (details.mode === 'exec' && host.allowExec !== true) throw new Error(`exec_not_allowed: host ${JSON.stringify(params.host)} requires allowExec: true`);
     if (!isAbsolute(params.cwd) || /[\0\r\n]/.test(params.cwd)) throw new Error('invalid_cwd: expected an absolute path without NUL/newlines');
@@ -182,10 +192,11 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > config.maxTimeoutSeconds) throw new Error(`invalid_timeout: maximum ${config.maxTimeoutSeconds}s`);
     const reuse = options.transport ? null : controlPath();
     const request = (kind: TransportRequest['kind'], script: string, supervisorConfig?: SupervisorConfig) => transport({ kind, script, argv: sshArgv(host.sshAlias, remoteShellCommand(script), { controlPath: reuse }), supervisorConfig });
-    cleanupCheck = () => request('cleanup', buildCleanupCheckScript({ runId }));
+    cleanupCheck = () => request('cleanup', buildCleanupCheckScript({ runId, ...(details.runPolicy?.unitName ? { stopUnit: details.runPolicy.unitName } : {}) }));
     update();
     progressTimer = setInterval(update, 500);
-    const probe = parseProbe(await capture(request('probe', buildProbeScript({ cwd: params.cwd, runId, exec: details.mode === 'exec' })), 30000, options.signal));
+    const probe = parseProbe(await capture(request('probe', buildProbeScript({ cwd: params.cwd, runId, exec: details.mode === 'exec', runPolicy: host.runPolicy })), 30000, options.signal));
+    if (details.runPolicy && probe.modeObserved !== undefined) details.runPolicy.modeObserved = probe.modeObserved;
     if (!probe.cwdReal) throw new Error('remote_cwd_missing');
     if (host.allowedCwdRoots?.length && !host.allowedCwdRoots.some(root => inside(probe.cwdReal!, root))) throw new Error('remote_cwd_not_allowed');
     if (!probe.ompPath || !probe.runDir || !probe.bunVersion) throw new Error('unsupported_remote_omp: missing omp, embedded Bun, or run directory');
@@ -196,10 +207,10 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     const flags = supportedFlags(probe.help);
     for (const arg of ompArgs) if (arg.startsWith('--') && !flags.has(arg)) throw new Error(`unsupported_remote_omp: missing ${arg}`);
     if (options.signal?.aborted) throw new Error('aborted_before_launch');
-    const supervisorConfig: SupervisorConfig = { runId, ompPath: probe.ompPath, ompArgs, cwd: probe.cwdReal, runDir: probe.runDir, mode: details.mode, deadlineSeconds: timeoutSeconds, graceSeconds: graceMs / 1000, overlayYaml: exec ? execOverlay(probe.disabledProviders) : OVERLAY_YAML };
+    const supervisorConfig: SupervisorConfig = { runId, ompPath: probe.ompPath, ompArgs, cwd: probe.cwdReal, runDir: probe.runDir, mode: details.mode, deadlineSeconds: timeoutSeconds, graceSeconds: graceMs / 1000, overlayYaml: exec ? execOverlay(probe.disabledProviders) : OVERLAY_YAML, ...(host.runPolicy?.requireMode ? { requireMode: host.runPolicy.requireMode } : {}) };
     const splitter = new LineSplitter(); const decoder = new RpcFrameDecoder();
     phase = 'starting'; update();
-    child = request('launch', buildLaunchScript({ ompPath: probe.ompPath, runDir: probe.runDir, supervisorSource: SUPERVISOR_SOURCE, supervisorConfig }), supervisorConfig);
+    child = request('launch', buildLaunchScript({ ompPath: probe.ompPath, runDir: probe.runDir, supervisorSource: SUPERVISOR_SOURCE, supervisorConfig, runPolicy: host.runPolicy, runId }), supervisorConfig);
     child.stdin?.on('error', error => enqueue({ kind: 'local_error', code: 'stdin_error', message: String(error) }));
     child.stdout?.on('data', chunk => {
       try { for (const line of splitter.push(chunk)) { const frame = decoder.push(line); if (frame) { record('received', frame); enqueue({ kind: 'frame', frame }); } } }
@@ -273,6 +284,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     if (!transportClosed) { child.kill('SIGKILL'); reduce({ kind: 'transport_closed', exitCode: null, signal: 'SIGKILL' }); }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
+    if (error instanceof RemoteModeError && details.runPolicy) details.runPolicy.modeObserved = error.observed;
     details.error = { code: message.split(':')[0], message };
     reduce({ kind: 'local_error', ...details.error });
     if (child && !transportClosed) {
@@ -287,7 +299,7 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
     clearInterval(progressTimer);
     options.signal?.removeEventListener('abort', abort);
   }
-  if (child && state.abortRequested && !state.supervisor.exited && cleanupCheck) {
+  if (child && !state.supervisor.exited && cleanupCheck && (state.abortRequested || details.runPolicy?.unitName)) {
     try { details.postCheck = { output: await capture(cleanupCheck(), 10000) }; }
     catch (error) { details.postCheck = { error: String(error) }; }
   }
@@ -303,6 +315,18 @@ export async function runRemoteTask(params: RemoteTaskParams, options: RunnerOpt
   const stderrTail = state.supervisor.exited?.stderrTail;
   if (details.status === 'failed' && !promptSent && typeof stderrTail === 'string' && stderrTail.trim()) {
     details.error = { code: 'remote_omp_exited_before_ready', message: `Remote omp exited before the prompt was sent:\n${stderrTail}` };
+  }
+  const policyReason = state.supervisor.exited?.reason;
+  if (details.runPolicy && !state.abortRequested) {
+    const unitStopped = details.runPolicy.unitName && (policyReason === 'supervisor_signal' || (!state.supervisor.exited && unitExitCode !== undefined));
+    const code = policyReason === 'remote_mode_not_allowed' || policyReason === 'mode_changed' ? policyReason
+      : unitStopped ? (!state.supervisor.started && unitExitCode !== undefined && unitExitCode !== 0 ? 'remote_unit_launch_failed' : 'remote_unit_stopped') : undefined;
+    if (code) {
+      if (state.supervisor.exited?.groupGone === true || unitExitCode !== undefined) details.status = 'failed';
+      details.error = { code, message: code === 'remote_unit_stopped' || code === 'remote_unit_launch_failed'
+        ? `Remote unit ${details.runPolicy.unitName} ${code === 'remote_unit_launch_failed' ? 'failed before supervisor startup' : 'stopped without caller cancellation'} (unit exit ${unitExitCode ?? 'unobserved'}; see ${localLogDir}/ssh-stderr.log)`
+        : `${code}: observed ${JSON.stringify(details.runPolicy.modeObserved ?? 'unreadable')}${details.status === 'unknown' ? '; owned-process cleanup is unconfirmed. Do not automatically resend.' : ''}` };
+    }
   }
   if (!details.error && details.status !== 'completed') {
     const remoteError = typeof state.promptResult?.error === 'string' ? state.promptResult.error : state.promptResponseError;

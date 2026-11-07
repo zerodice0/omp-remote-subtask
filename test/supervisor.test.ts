@@ -24,7 +24,15 @@ if (role === 'env') {
   setInterval(() => {}, 1000);
 } else {
   const input = createInterface({ input: process.stdin });
-  if (role === 'intermediate') {
+  if (role === 'graceful') {
+    console.log(JSON.stringify({ fixture: 'ready' }));
+    input.on('line', line => {
+      if (JSON.parse(line).type === 'abort') {
+        console.log(JSON.stringify({ fixture: 'aborted' }));
+        process.exit(0);
+      }
+    });
+  } else if (role === 'intermediate') {
     const leaf = spawn(process.execPath, [import.meta.filename, 'leaf'], { detached: true, stdio: ['ignore', 'pipe', 'inherit'], env: { ...process.env, BUN_BE_BUN: '1' } });
     leaf.stdout.pipe(process.stdout);
     input.on('line', () => process.exit(0));
@@ -78,10 +86,10 @@ test('malformed ps output cannot silently discard process ownership', () => {
   expect(snapshot('\n 10 1 10 \n').get(10)).toEqual({ pid: 10, ppid: 1, pgid: 10 });
 });
 
-function launch(name: string, role: string, mode?: 'read' | 'exec', deadlineSeconds = 15) {
+function launch(name: string, role: string, mode?: 'read' | 'exec', deadlineSeconds = 15, requireMode?: { path: string; value: string }) {
   const runDir = join(scratch, name);
   mkdirSync(runDir);
-  const config = { runId: name, ompPath: executable, ompArgs: [role], cwd: scratch, runDir, deadlineSeconds, graceSeconds: 0.2, overlayYaml: '', ...(mode ? { mode } : {}) };
+  const config = { runId: name, ompPath: executable, ompArgs: [role], cwd: scratch, runDir, deadlineSeconds, graceSeconds: 0.2, overlayYaml: '', ...(mode ? { mode } : {}), ...(requireMode ? { requireMode } : {}) };
   const child = spawn(process.execPath, [supervisor, Buffer.from(JSON.stringify(config)).toString('base64')], { env: { ...process.env, BUN_BE_BUN: '1', TMPDIR: scratch }, stdio: 'pipe' });
   let output = '';
   let stderr = '';
@@ -117,6 +125,8 @@ test('exec creates private work/tmp and passes per-run TMPDIR without changing c
     expect(env.cwd).toBe(scratch);
     for (const directory of ['work', 'tmp']) expect(statSync(join(run.runDir, directory)).mode & 0o777).toBe(0o700);
     expect(run.frames().at(-1)).toMatchObject({ event: 'exited', groupGone: true, escapedGone: true, descendantsGone: true });
+    expect(run.frames().find(frame => frame.event === 'started')).not.toHaveProperty('modeObserved');
+    expect(run.frames().at(-1)).not.toHaveProperty('modeObserved');
     expect(run.stderr()).toBe('');
   } finally { killChild(run.child); }
 });
@@ -130,6 +140,93 @@ test('omitted mode uses run TMPDIR without creating an exec work directory', asy
     expect(existsSync(join(run.runDir, 'tmp'))).toBe(true);
   } finally { killChild(run.child); }
 });
+
+test('matching mode policy reports the observed mode on normal start and exit', async () => {
+  const path = join(scratch, 'matching-mode.mode');
+  writeFileSync(path, 'server\n\n');
+  const run = launch('mode-matching', 'env', 'exec', 15, { path, value: 'server' });
+  try {
+    expect(await run.closed).toBe(0);
+    expect(run.frames().find(frame => frame.fixture === 'env')).toBeDefined();
+    expect(run.frames().find(frame => frame.event === 'started')).toMatchObject({ modeObserved: 'server' });
+    expect(run.frames().at(-1)).toMatchObject({
+      event: 'exited', reason: 'child_exit', modeObserved: 'server', groupGone: true,
+    });
+    expect(run.stderr()).toBe('');
+  } finally { killChild(run.child); }
+});
+
+test.each([
+  { name: 'game', contents: 'game\n', observed: 'game' },
+  { name: 'spaces', contents: 'server \n', observed: 'server ' },
+  { name: 'crlf', contents: 'server\r\n', observed: 'server\r' },
+  { name: 'missing', contents: undefined, observed: 'unreadable' },
+  { name: 'missing-sentinel-value', contents: undefined, observed: 'unreadable', value: 'unreadable' },
+])('mode policy rejects $name before spawning omp', async ({ name, contents, observed, value }) => {
+  const path = join(scratch, `initial-${name}.mode`);
+  if (contents !== undefined) writeFileSync(path, contents);
+  const run = launch(`initial-${name}`, 'env', 'exec', 15, { path, value: value ?? 'server' });
+  try {
+    expect(await run.closed).toBe(0);
+    expect(run.frames()).toEqual([expect.objectContaining({
+      event: 'exited', reason: 'remote_mode_not_allowed', modeObserved: observed,
+      code: null, signal: null, groupGone: true, descendantsGone: true, escapedGone: true,
+      termSent: false, killSent: false,
+    })]);
+    expect(run.stderr()).toBe('');
+  } finally { killChild(run.child); }
+});
+
+test.each(['game', 'unreadable'] as const)('mode policy gracefully aborts omp when mode becomes %s', async observed => {
+  const path = join(scratch, `graceful-${observed}.mode`);
+  writeFileSync(path, 'server\n\n');
+  const run = launch(`mode-graceful-${observed}`, 'graceful', 'exec', 15, { path, value: 'server' });
+  try {
+    await until(() => run.frames().some(frame => frame.fixture === 'ready'));
+    expect(run.frames().find(frame => frame.event === 'started')).toMatchObject({ modeObserved: 'server' });
+    if (observed === 'unreadable') rmSync(path);
+    else writeFileSync(path, 'game\n');
+    await run.closed;
+    expect(run.frames().some(frame => frame.fixture === 'aborted')).toBe(true);
+    expect(run.frames().at(-1)).toMatchObject({
+      event: 'exited', reason: 'mode_changed', modeObserved: observed, code: 0,
+      groupGone: true, descendantsGone: true, escapedGone: true, termSent: false, killSent: false,
+    });
+    expect(run.stderr()).toBe('');
+  } finally {
+    killChild(run.child);
+    const started = run.frames().find(frame => frame.event === 'started');
+    if (started?.pgid) { try { process.kill(-started.pgid, 'SIGKILL'); } catch {} }
+  }
+}, 12000);
+
+test('mode change cleans up tracked detached descendants', async () => {
+  const path = join(scratch, 'escaped-mode.mode');
+  writeFileSync(path, 'server\n');
+  const run = launch('mode-escaped', 'root', 'exec', 15, { path, value: 'server' });
+  let escapedPid: number | undefined;
+  try {
+    await until(() => run.frames().some(frame => frame.fixture === 'leaf'));
+    escapedPid = run.frames().find(frame => frame.fixture === 'leaf').pid;
+    const log = join(run.runDir, 'supervisor.log');
+    await until(() => readFileSync(log, 'utf8').includes(`"pid":${escapedPid},`));
+    run.child.stdin.write('release\n');
+    await until(() => run.frames().some(frame => frame.fixture === 'reparented'));
+    writeFileSync(path, 'game\n');
+    await run.closed;
+    expect(run.frames().at(-1)).toMatchObject({
+      event: 'exited', reason: 'mode_changed', modeObserved: 'game',
+      groupGone: true, descendantsGone: true, escapedGone: true, termSent: true, killSent: true,
+    });
+    expect(live(escapedPid!)).toBe(false);
+    expect(run.stderr()).toBe('');
+  } finally {
+    killChild(run.child);
+    if (escapedPid && live(escapedPid)) process.kill(escapedPid, 'SIGKILL');
+    const started = run.frames().find(frame => frame.event === 'started');
+    if (started?.pgid) { try { process.kill(-started.pgid, 'SIGKILL'); } catch {} }
+  }
+}, 12000);
 
 test('shutdown kills a tracked detached child after reparenting and leaves unrelated processes alive', async () => {
   const unrelated = spawn('sleep', ['300'], { detached: true, stdio: 'ignore' });

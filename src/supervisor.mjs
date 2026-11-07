@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, fstatSync, readSync } from 'node:fs';
+import { mkdirSync, writeFileSync, appendFileSync, openSync, closeSync, fstatSync, readSync, readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
@@ -60,15 +60,34 @@ function supervise(config) {
   const { runId, ompPath, ompArgs, cwd, runDir, deadlineSeconds, graceSeconds = 10, overlayYaml } = config;
   mkdirSync(join(runDir, 'sessions'), { recursive: true, mode: 0o700 });
   writeFileSync(join(runDir, 'overlay.yml'), overlayYaml, { mode: 0o600 });
-  const stderr = openSync(join(runDir, 'omp.stderr.log'), 'a', 0o600);
+  let stdoutOpen = true;
+  const log = record => appendFileSync(join(runDir, 'supervisor.log'), JSON.stringify({ ts: new Date().toISOString(), ...record }) + '\n');
+  function frame(record) {
+    const value = { type: 'remote_subtask_supervisor', runId, ...record };
+    log(value);
+    if (stdoutOpen) process.stdout.write(JSON.stringify(value) + '\n');
+  }
+  function readMode() {
+    try { return { observed: readFileSync(config.requireMode.path, 'utf8').replace(/\n+$/, ''), readable: true }; }
+    catch { return { observed: 'unreadable', readable: false }; }
+  }
+  let modeObserved;
   const env = { ...process.env };
   delete env.BUN_BE_BUN;
   mkdirSync(join(runDir, 'tmp'), { recursive: true, mode: 0o700 });
   env.TMPDIR = join(runDir, 'tmp');
   if (config.mode === 'exec') mkdirSync(join(runDir, 'work'), { recursive: true, mode: 0o700 });
+  if (config.requireMode) {
+    const mode = readMode();
+    modeObserved = mode.observed;
+    if (!mode.readable || modeObserved !== config.requireMode.value) {
+      frame({ event: 'exited', code: null, signal: null, reason: 'remote_mode_not_allowed', modeObserved, termSent: false, killSent: false, groupGone: true, descendantsGone: true, escapedGone: true, escapedPids: [], escapedGroups: [] });
+      return;
+    }
+  }
+  const stderr = openSync(join(runDir, 'omp.stderr.log'), 'a', 0o600);
   const child = spawn(ompPath, ompArgs, { cwd, detached: true, env, stdio: ['pipe', 'pipe', stderr] });
   closeSync(stderr);
-  let stdoutOpen = true;
   let exited = false;
   let exitCode = null;
   let exitSignal = null;
@@ -86,12 +105,6 @@ function supervise(config) {
   let trackingError;
   const graceMs = Math.max(10, graceSeconds * 1000);
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
-  const log = record => appendFileSync(join(runDir, 'supervisor.log'), JSON.stringify({ ts: new Date().toISOString(), ...record }) + '\n');
-  function frame(record) {
-    const value = { type: 'remote_subtask_supervisor', runId, ...record };
-    log(value);
-    if (stdoutOpen) process.stdout.write(JSON.stringify(value) + '\n');
-  }
   function ps(fields) {
     const listing = spawnSync('ps', ['-A', '-o', fields], { encoding: 'utf8' });
     if (listing.error || listing.status !== 0) throw new Error(`ps failed: ${listing.error || listing.stderr || listing.status}`);
@@ -164,6 +177,7 @@ function supervise(config) {
     if (finishing) return finishing;
     finishing = (async () => {
       clearTimeout(deadline);
+      clearInterval(modeWatcher);
       input.close();
       process.stdin.pause();
       let groupGone = false;
@@ -198,7 +212,7 @@ function supervise(config) {
           stderrTail = buffer.toString('utf8', 0, readSync(fd, buffer, 0, buffer.length, Math.max(0, size - buffer.length)));
         } finally { closeSync(fd); }
       } catch (caught) { log({ error: String(caught), source: 'stderr_tail' }); }
-      frame({ event: 'exited', code: exitCode, signal: exitSignal, reason, termSent, killSent, groupGone, descendantsGone, escapedGone, escapedPids: [...escapedPids], escapedGroups: [...escapedGroups], ...(error ? { error } : {}), ...(stderrTail ? { stderrTail } : {}) });
+      frame({ event: 'exited', code: exitCode, signal: exitSignal, reason, ...(config.requireMode ? { modeObserved } : {}), termSent, killSent, groupGone, descendantsGone, escapedGone, escapedPids: [...escapedPids], escapedGroups: [...escapedGroups], ...(error ? { error } : {}), ...(stderrTail ? { stderrTail } : {}) });
       if (stdoutOpen) await new Promise(resolve => process.stdout.write('', resolve));
       process.exit(exitCode === null ? 0 : exitCode);
     })();
@@ -246,11 +260,17 @@ function supervise(config) {
     }
   });
   input.on('close', () => { if (!exited) void shutdown('stdin_eof'); });
+  const modeWatcher = config.requireMode ? setInterval(() => {
+    if (shuttingDown) return;
+    const mode = readMode();
+    modeObserved = mode.observed;
+    if (!mode.readable || modeObserved !== config.requireMode.value) void shutdown('mode_changed');
+  }, 2000) : undefined;
   const deadline = setTimeout(() => void shutdown('deadline'), deadlineSeconds * 1000);
   child.on('error', error => { log({ error: String(error) }); exited = true; exitCode = 1; void finish(); });
   child.on('exit', (code, signal) => { exited = true; owned.delete(pgid); exitCode = code; exitSignal = signal; void finish(); });
   child.on('close', () => { void finish(); });
-  if (pgid) frame({ event: 'started', pid: child.pid, pgid, runDir, sessionDir: join(runDir, 'sessions') });
+  if (pgid) frame({ event: 'started', pid: child.pid, pgid, runDir, sessionDir: join(runDir, 'sessions'), ...(config.requireMode ? { modeObserved } : {}) });
   child.stdout.pipe(process.stdout, { end: false });
   process.on('SIGTERM', () => void shutdown('supervisor_signal', true));
   process.on('SIGINT', () => void shutdown('supervisor_signal', true));
